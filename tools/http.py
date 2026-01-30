@@ -7,14 +7,25 @@ reads API documentation and makes curl-like requests directly.
 
 Security: Only allows requests to whitelisted domains.
 """
+import json
 import logging
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 import httpx
 
 from tools.registry import tool
 
 logger = logging.getLogger("brainmap.tools.http")
+
+
+def _parse_json_if_string(value: Any) -> Any:
+    """Parse JSON string to dict if needed."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
 
 
 # Whitelisted domains for HTTP requests
@@ -88,8 +99,8 @@ Example for Notion search:
 async def http_request(
     method: str,
     url: str,
-    headers: Optional[Dict[str, str]] = None,
-    body: Optional[Dict[str, Any]] = None,
+    headers: Optional[Union[Dict[str, str], str]] = None,
+    body: Optional[Union[Dict[str, Any], str]] = None,
     timeout: int = 30
 ) -> Dict[str, Any]:
     """
@@ -98,13 +109,17 @@ async def http_request(
     Args:
         method: HTTP method (GET, POST, PATCH, PUT, DELETE)
         url: Full URL to request
-        headers: Request headers (use $ENV_VAR for secrets)
-        body: JSON body for POST/PATCH/PUT requests
+        headers: Request headers (use $ENV_VAR for secrets) - can be dict or JSON string
+        body: JSON body for POST/PATCH/PUT requests - can be dict or JSON string
         timeout: Request timeout in seconds (default 30)
 
     Returns:
         Response with status_code, headers, and body
     """
+    # Parse JSON strings if agent passed strings instead of dicts
+    headers = _parse_json_if_string(headers)
+    body = _parse_json_if_string(body)
+
     # Validate domain
     if not _is_domain_allowed(url):
         return {
@@ -120,8 +135,17 @@ async def http_request(
             "status_code": 400
         }
 
+    # Ensure headers is a dict
+    if headers is None:
+        headers = {}
+    elif not isinstance(headers, dict):
+        return {
+            "error": f"headers must be a dictionary, got {type(headers).__name__}",
+            "status_code": 400
+        }
+
     # Substitute environment variables in headers
-    request_headers = _substitute_env_vars(headers or {})
+    request_headers = _substitute_env_vars(headers)
 
     # Add default content-type for requests with body
     if body and "Content-Type" not in request_headers:
