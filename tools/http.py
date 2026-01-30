@@ -62,16 +62,27 @@ def _get_env_value(key: str) -> Optional[str]:
 
 
 def _substitute_env_vars(headers: Dict[str, str]) -> Dict[str, str]:
-    """Substitute environment variables in header values."""
+    """Substitute environment variables in header values.
+
+    Supports both:
+    - "$NOTION_API_KEY" -> "ntn_xxxxx"
+    - "Bearer $NOTION_API_KEY" -> "Bearer ntn_xxxxx"
+    """
+    import re
     result = {}
     for key, value in headers.items():
-        if isinstance(value, str) and value.startswith("$"):
-            env_val = _get_env_value(value)
-            if env_val:
-                result[key] = env_val
-            else:
-                logger.warning(f"Environment variable {value} not found")
-                result[key] = value
+        if isinstance(value, str) and "$" in value:
+            # Find all $VAR patterns and substitute them
+            def replace_env(match):
+                var_name = match.group(1)
+                env_val = os.environ.get(var_name)
+                if env_val:
+                    return env_val
+                else:
+                    logger.warning(f"Environment variable ${var_name} not found")
+                    return match.group(0)  # Return original if not found
+
+            result[key] = re.sub(r'\$([A-Z_][A-Z0-9_]*)', replace_env, value)
         else:
             result[key] = value
     return result
