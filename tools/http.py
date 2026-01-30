@@ -6,16 +6,110 @@ This enables skill-based integrations like Notion, where the agent
 reads API documentation and makes curl-like requests directly.
 
 Security: Only allows requests to whitelisted domains.
+Response Limiting: Large responses are truncated to prevent rate limits.
 """
 import json
 import logging
 import os
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 import httpx
 
 from tools.registry import tool
 
 logger = logging.getLogger("brainmap.tools.http")
+
+# Maximum response size in characters (roughly ~8K tokens)
+MAX_RESPONSE_CHARS = 30000
+# Maximum number of items in array responses (for Notion search, etc.)
+MAX_ARRAY_ITEMS = 10
+
+
+def _truncate_notion_response(body: Any) -> Any:
+    """Truncate Notion API responses to prevent token explosion.
+
+    Notion search can return hundreds of pages with full metadata.
+    We only need the essential info: id, title, url.
+    """
+    if not isinstance(body, dict):
+        return body
+
+    # Handle Notion search/query results
+    if "results" in body and isinstance(body["results"], list):
+        results = body["results"]
+        truncated_results = []
+
+        for item in results[:MAX_ARRAY_ITEMS]:  # Limit to 10 items
+            if isinstance(item, dict):
+                # Extract only essential fields
+                simplified = {
+                    "id": item.get("id"),
+                    "object": item.get("object"),  # "page" or "database"
+                    "url": item.get("url"),
+                    "created_time": item.get("created_time"),
+                }
+
+                # Extract title based on object type
+                if item.get("object") == "page":
+                    props = item.get("properties", {})
+                    # Try common title property names
+                    for title_key in ["title", "Title", "Name", "name"]:
+                        if title_key in props:
+                            title_prop = props[title_key]
+                            if isinstance(title_prop, dict) and "title" in title_prop:
+                                title_array = title_prop["title"]
+                                if title_array and isinstance(title_array, list):
+                                    simplified["title"] = title_array[0].get("plain_text", "")
+                                    break
+                elif item.get("object") == "database":
+                    title_array = item.get("title", [])
+                    if title_array and isinstance(title_array, list):
+                        simplified["title"] = title_array[0].get("plain_text", "")
+
+                truncated_results.append(simplified)
+            else:
+                truncated_results.append(item)
+
+        return {
+            "results": truncated_results,
+            "total_results": len(results),
+            "showing": len(truncated_results),
+            "has_more": body.get("has_more", False),
+            "next_cursor": body.get("next_cursor"),
+            "_truncated": True if len(results) > MAX_ARRAY_ITEMS else False
+        }
+
+    return body
+
+
+def _truncate_response(body: Any, url: str) -> Any:
+    """Truncate response body to prevent rate limits.
+
+    Different APIs need different truncation strategies.
+    """
+    # Notion-specific handling
+    if "api.notion.com" in url:
+        return _truncate_notion_response(body)
+
+    # Generic truncation for other APIs
+    if isinstance(body, dict):
+        body_str = json.dumps(body)
+        if len(body_str) > MAX_RESPONSE_CHARS:
+            # For large dicts, try to preserve structure but truncate values
+            return {
+                "_truncated": True,
+                "_original_size": len(body_str),
+                "preview": body_str[:MAX_RESPONSE_CHARS] + "...[TRUNCATED]"
+            }
+    elif isinstance(body, list) and len(body) > MAX_ARRAY_ITEMS:
+        return {
+            "_truncated": True,
+            "_total_items": len(body),
+            "items": body[:MAX_ARRAY_ITEMS]
+        }
+    elif isinstance(body, str) and len(body) > MAX_RESPONSE_CHARS:
+        return body[:MAX_RESPONSE_CHARS] + "...[TRUNCATED]"
+
+    return body
 
 
 def _parse_json_if_string(value: Any) -> Any:
@@ -174,12 +268,14 @@ async def http_request(
             # Try to parse JSON response
             try:
                 response_body = response.json()
+                # Truncate large responses to prevent rate limits
+                response_body = _truncate_response(response_body, url)
             except Exception:
                 response_body = response.text[:5000]  # Limit text response
 
+            # Don't return headers (they're rarely needed and add tokens)
             return {
                 "status_code": response.status_code,
-                "headers": dict(response.headers),
                 "body": response_body,
                 "ok": response.is_success
             }
