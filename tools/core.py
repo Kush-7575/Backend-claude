@@ -491,16 +491,25 @@ async def complete_reminder(reminder_id: str) -> Dict[str, Any]:
     - Understanding "today", "tomorrow", etc."""
 )
 async def get_current_time() -> Dict[str, Any]:
-    """Get current time with various formats."""
-    now = datetime.now(timezone.utc)
-    
+    """Get current time with various formats in user's timezone (Pacific Time)."""
+    # User's timezone: Pacific Time (PT)
+    # UTC-8 in standard time, UTC-7 in daylight saving time
+    import os
+
+    # Get timezone offset from env or default to Pacific (-8 hours)
+    tz_offset = int(os.environ.get("USER_TIMEZONE_OFFSET", "-8"))
+    user_tz = timezone(timedelta(hours=tz_offset))
+
+    now = datetime.now(user_tz)
+
     return {
         "iso": now.isoformat(),
         "date": now.strftime("%Y-%m-%d"),
         "time": now.strftime("%H:%M:%S"),
         "day": now.strftime("%A"),
         "formatted": now.strftime("%B %d, %Y at %I:%M %p"),
-        "timestamp": int(now.timestamp())
+        "timestamp": int(now.timestamp()),
+        "timezone": "PT" if tz_offset == -8 else f"UTC{tz_offset:+d}"
     }
 
 
@@ -581,10 +590,17 @@ async def _find_similar_note(topic: str) -> Optional[Dict[str, Any]]:
     return best_match
 
 
+def _get_user_timezone() -> timezone:
+    """Get user's timezone (Pacific Time by default)."""
+    import os
+    tz_offset = int(os.environ.get("USER_TIMEZONE_OFFSET", "-8"))
+    return timezone(timedelta(hours=tz_offset))
+
+
 def _parse_natural_time(time_str: str) -> Optional[datetime]:
     """
     Parse natural language time expressions.
-    
+
     Handles:
     - "tomorrow", "today"
     - "in X hours/minutes"
@@ -592,7 +608,8 @@ def _parse_natural_time(time_str: str) -> Optional[datetime]:
     - "Monday", "Tuesday", etc.
     - "9am", "3:30pm"
     """
-    now = datetime.now(timezone.utc)
+    user_tz = _get_user_timezone()
+    now = datetime.now(user_tz)
     time_lower = time_str.lower().strip()
     
     # Relative time patterns
