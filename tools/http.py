@@ -24,59 +24,147 @@ MAX_RESPONSE_CHARS = 30000
 MAX_ARRAY_ITEMS = 10
 
 
-def _truncate_notion_response(body: Any) -> Any:
-    """Truncate Notion API responses to prevent token explosion.
+def _extract_notion_title(item: Dict) -> str:
+    """Extract title from a Notion page or database object."""
+    if item.get("object") == "page":
+        props = item.get("properties", {})
+        for title_key in ["title", "Title", "Name", "name", "Task", "Task name"]:
+            if title_key in props:
+                title_prop = props[title_key]
+                if isinstance(title_prop, dict) and "title" in title_prop:
+                    title_array = title_prop["title"]
+                    if title_array and isinstance(title_array, list):
+                        return title_array[0].get("plain_text", "(untitled)")
+        return "(untitled page)"
+    elif item.get("object") == "database":
+        title_array = item.get("title", [])
+        if title_array and isinstance(title_array, list):
+            return title_array[0].get("plain_text", "(untitled)")
+        return "(untitled database)"
+    return "(unknown)"
 
-    Notion search can return hundreds of pages with full metadata.
-    We only need the essential info: id, title, url.
+
+def _format_notion_search_results(body: Dict) -> str:
+    """Format Notion search results as human-readable text.
+
+    Instead of returning raw JSON, return a clean summary that's
+    easy for Claude to understand and uses minimal tokens.
+    """
+    results = body.get("results", [])
+    total = len(results)
+    has_more = body.get("has_more", False)
+
+    if not results:
+        return "No results found."
+
+    lines = [f"Found {total} result(s){' (more available)' if has_more else ''}:\n"]
+
+    for i, item in enumerate(results[:MAX_ARRAY_ITEMS], 1):
+        if not isinstance(item, dict):
+            continue
+
+        obj_type = item.get("object", "unknown")
+        title = _extract_notion_title(item)
+        page_id = item.get("id", "")
+        url = item.get("url", "")
+
+        # Format: "1. [page] Meeting Notes (id: abc123)"
+        lines.append(f"{i}. [{obj_type}] {title}")
+        lines.append(f"   id: {page_id}")
+        if url:
+            lines.append(f"   url: {url}")
+
+    if total > MAX_ARRAY_ITEMS:
+        lines.append(f"\n... and {total - MAX_ARRAY_ITEMS} more results")
+        if body.get("next_cursor"):
+            lines.append(f"Use next_cursor: {body['next_cursor']} to fetch more")
+
+    return "\n".join(lines)
+
+
+def _format_notion_page(body: Dict) -> Dict:
+    """Format a single Notion page response - keep as JSON but simplified."""
+    if body.get("object") != "page":
+        return body
+
+    return {
+        "id": body.get("id"),
+        "url": body.get("url"),
+        "title": _extract_notion_title(body),
+        "created_time": body.get("created_time"),
+        "last_edited_time": body.get("last_edited_time"),
+        "properties": body.get("properties", {})  # Keep properties for updates
+    }
+
+
+def _format_notion_blocks(body: Dict) -> str:
+    """Format Notion blocks (page content) as readable text."""
+    results = body.get("results", [])
+    if not results:
+        return "Page has no content blocks."
+
+    lines = []
+    for block in results[:20]:  # Limit to 20 blocks
+        block_type = block.get("type", "unknown")
+        block_data = block.get(block_type, {})
+
+        # Extract text content
+        rich_text = block_data.get("rich_text", [])
+        text = "".join(rt.get("plain_text", "") for rt in rich_text)
+
+        if block_type == "paragraph":
+            lines.append(text or "(empty paragraph)")
+        elif block_type.startswith("heading_"):
+            level = block_type[-1]
+            lines.append(f"{'#' * int(level)} {text}")
+        elif block_type == "bulleted_list_item":
+            lines.append(f"• {text}")
+        elif block_type == "numbered_list_item":
+            lines.append(f"- {text}")
+        elif block_type == "to_do":
+            checked = "✓" if block_data.get("checked") else "○"
+            lines.append(f"{checked} {text}")
+        elif block_type == "code":
+            lang = block_data.get("language", "")
+            lines.append(f"```{lang}\n{text}\n```")
+        elif block_type == "divider":
+            lines.append("---")
+        else:
+            if text:
+                lines.append(f"[{block_type}] {text}")
+
+    if len(results) > 20:
+        lines.append(f"\n... and {len(results) - 20} more blocks")
+
+    return "\n".join(lines)
+
+
+def _format_notion_response(body: Any, url: str) -> Any:
+    """Format Notion API responses as human-readable text.
+
+    This dramatically reduces token usage while preserving
+    all the information Claude needs to take action.
     """
     if not isinstance(body, dict):
         return body
 
-    # Handle Notion search/query results
+    # Search results → formatted text list
     if "results" in body and isinstance(body["results"], list):
-        results = body["results"]
-        truncated_results = []
+        # Check if it's blocks (page content) vs search results
+        if body.get("results") and body["results"][0].get("type"):
+            # This is blocks (page content)
+            return _format_notion_blocks(body)
+        else:
+            # This is search/query results
+            return _format_notion_search_results(body)
 
-        for item in results[:MAX_ARRAY_ITEMS]:  # Limit to 10 items
-            if isinstance(item, dict):
-                # Extract only essential fields
-                simplified = {
-                    "id": item.get("id"),
-                    "object": item.get("object"),  # "page" or "database"
-                    "url": item.get("url"),
-                    "created_time": item.get("created_time"),
-                }
+    # Single page → simplified JSON
+    if body.get("object") == "page":
+        return _format_notion_page(body)
 
-                # Extract title based on object type
-                if item.get("object") == "page":
-                    props = item.get("properties", {})
-                    # Try common title property names
-                    for title_key in ["title", "Title", "Name", "name"]:
-                        if title_key in props:
-                            title_prop = props[title_key]
-                            if isinstance(title_prop, dict) and "title" in title_prop:
-                                title_array = title_prop["title"]
-                                if title_array and isinstance(title_array, list):
-                                    simplified["title"] = title_array[0].get("plain_text", "")
-                                    break
-                elif item.get("object") == "database":
-                    title_array = item.get("title", [])
-                    if title_array and isinstance(title_array, list):
-                        simplified["title"] = title_array[0].get("plain_text", "")
-
-                truncated_results.append(simplified)
-            else:
-                truncated_results.append(item)
-
-        return {
-            "results": truncated_results,
-            "total_results": len(results),
-            "showing": len(truncated_results),
-            "has_more": body.get("has_more", False),
-            "next_cursor": body.get("next_cursor"),
-            "_truncated": True if len(results) > MAX_ARRAY_ITEMS else False
-        }
+    # Database schema → keep as-is (usually small)
+    if body.get("object") == "database":
+        return body
 
     return body
 
@@ -86,9 +174,9 @@ def _truncate_response(body: Any, url: str) -> Any:
 
     Different APIs need different truncation strategies.
     """
-    # Notion-specific handling
+    # Notion-specific handling - format as readable text
     if "api.notion.com" in url:
-        return _truncate_notion_response(body)
+        return _format_notion_response(body, url)
 
     # Generic truncation for other APIs
     if isinstance(body, dict):
