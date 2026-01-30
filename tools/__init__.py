@@ -11,6 +11,9 @@ from tools.memory_tools import (
     MEMORY_TOOLS
 )
 
+# Import HTTP tool for external API calls (Notion, etc.)
+from tools.http import http_request
+
 __all__ = [
     "ToolRegistry",
     "ToolDefinition",
@@ -24,4 +27,6 @@ __all__ = [
     "memory_list",
     "set_memory_dependencies",
     "MEMORY_TOOLS",
+    # HTTP tool
+    "http_request",
 ]
