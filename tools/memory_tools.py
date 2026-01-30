@@ -52,33 +52,7 @@ Use this as your PRIMARY search tool for any question about:
 - Saved content ("what notes do I have about Y?")
 - Tasks/reminders ("what do I need to do?")
 
-Returns ranked results from all sources.""",
-    parameters={
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "What to search for (e.g., 'dentist appointment', 'project deadline', 'recipe')"
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum number of results to return (default: 10)",
-                "default": 10
-            },
-            "min_score": {
-                "type": "number",
-                "description": "Minimum relevance score 0-1 (default: 0.2)",
-                "default": 0.2
-            },
-            "sources": {
-                "type": "array",
-                "items": {"type": "string", "enum": ["memory", "daily", "sessions", "notes", "reminders"]},
-                "description": "Which sources to search (default: all)",
-                "default": ["memory", "daily", "sessions", "notes", "reminders"]
-            }
-        },
-        "required": ["query"]
-    }
+Returns ranked results from all sources."""
 )
 async def memory_search(
     query: str,
@@ -264,27 +238,7 @@ Uses Supabase tables as primary storage (persistent on Railway).
 Falls back to local files only if database unavailable.
 
 Use this to read specific memory content.
-For searching across all memories, use memory_search instead.""",
-    parameters={
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Memory type: 'MEMORY.md', 'long_term', or 'daily/YYYY-MM-DD'"
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Maximum number of entries to return (default: 50, max: 200)",
-                "default": 50
-            },
-            "user_id": {
-                "type": "string",
-                "description": "User ID (default: 'default')",
-                "default": "default"
-            }
-        },
-        "required": ["path"]
-    }
+For searching across all memories, use memory_search instead."""
 )
 async def memory_get(
     path: str,
@@ -384,23 +338,7 @@ Shows what memory exists:
 
 Uses Supabase tables as primary storage (persistent on Railway).
 
-Use this to discover what memory is available before reading it.""",
-    parameters={
-        "type": "object",
-        "properties": {
-            "category": {
-                "type": "string",
-                "description": "Which category to list ('memory', 'daily', or 'all')",
-                "default": "all",
-                "enum": ["memory", "daily", "all"]
-            },
-            "user_id": {
-                "type": "string",
-                "description": "User ID (default: 'default')",
-                "default": "default"
-            }
-        }
-    }
+Use this to discover what memory is available before reading it."""
 )
 async def memory_list(
     category: str = "all",
