@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     title VARCHAR(255),
     messages JSONB DEFAULT '[]',  -- Array of message objects
     compaction_count INT DEFAULT 0,  -- Number of times session was compacted
+    metadata JSONB DEFAULT '{}',  -- Session metadata
     active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
