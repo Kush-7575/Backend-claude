@@ -43,6 +43,90 @@ def is_notion_available() -> bool:
 
 
 @tool(
+    name="notion_get_page",
+    description="""Get the content of a Notion page.
+    Use to read what's on a page before modifying or to show the user."""
+)
+async def notion_get_page(
+    page_id: str
+) -> Dict[str, Any]:
+    """
+    Get page content (blocks).
+
+    Args:
+        page_id: ID of the page
+
+    Returns:
+        Page content as readable text
+    """
+    if not is_notion_available():
+        return {"error": "Notion not configured"}
+
+    client = _get_notion_client()
+
+    try:
+        # Get page metadata
+        page_resp = await client.get(f"/pages/{page_id}")
+        page_resp.raise_for_status()
+        page_data = page_resp.json()
+
+        # Get page blocks (content)
+        blocks_resp = await client.get(f"/blocks/{page_id}/children")
+        blocks_resp.raise_for_status()
+        blocks_data = blocks_resp.json()
+
+        # Extract title
+        title = ""
+        props = page_data.get("properties", {})
+        for key in ["title", "Title", "Name", "name"]:
+            if key in props and "title" in props[key]:
+                title_arr = props[key]["title"]
+                title = "".join(t.get("plain_text", "") for t in title_arr)
+                break
+
+        # Convert blocks to readable text
+        content_lines = []
+        for block in blocks_data.get("results", []):
+            block_type = block.get("type", "")
+            block_content = block.get(block_type, {})
+            rich_text = block_content.get("rich_text", [])
+            text = "".join(rt.get("plain_text", "") for rt in rich_text)
+
+            if block_type == "heading_1":
+                content_lines.append(f"# {text}")
+            elif block_type == "heading_2":
+                content_lines.append(f"## {text}")
+            elif block_type == "heading_3":
+                content_lines.append(f"### {text}")
+            elif block_type == "bulleted_list_item":
+                content_lines.append(f"• {text}")
+            elif block_type == "numbered_list_item":
+                content_lines.append(f"- {text}")
+            elif block_type == "to_do":
+                checked = "✓" if block_content.get("checked") else "○"
+                content_lines.append(f"{checked} {text}")
+            elif block_type == "code":
+                lang = block_content.get("language", "")
+                content_lines.append(f"```{lang}\n{text}\n```")
+            elif block_type == "child_database":
+                db_title = block.get("child_database", {}).get("title", "Database")
+                content_lines.append(f"[Database: {db_title}] (id: {block['id']})")
+            elif text:
+                content_lines.append(text)
+
+        return {
+            "id": page_id,
+            "title": title or "Untitled",
+            "url": page_data.get("url", ""),
+            "content": "\n".join(content_lines) if content_lines else "(empty page)"
+        }
+
+    except httpx.HTTPError as e:
+        logger.error(f"Notion get page failed: {e}")
+        return {"error": str(e)}
+
+
+@tool(
     name="notion_search",
     description="""Search Notion workspace for pages and databases.
     Use when user asks about Notion content or before creating new pages."""
@@ -480,4 +564,174 @@ async def notion_delete_block(
 
     except httpx.HTTPError as e:
         logger.error(f"Notion delete failed: {e}")
+        return {"error": str(e)}
+
+
+@tool(
+    name="notion_query_database",
+    description="""Query a Notion database with optional filters and sorting.
+    Use to list, filter, or search rows in a database/table."""
+)
+async def notion_query_database(
+    database_id: str,
+    filter_property: Optional[str] = None,
+    filter_value: Optional[str] = None,
+    sort_property: Optional[str] = None,
+    sort_direction: str = "descending",
+    limit: int = 20
+) -> Dict[str, Any]:
+    """
+    Query rows from a Notion database.
+
+    Args:
+        database_id: ID of the database
+        filter_property: Property name to filter by (optional)
+        filter_value: Value to filter for (optional)
+        sort_property: Property to sort by (optional)
+        sort_direction: "ascending" or "descending"
+        limit: Max rows to return (default 20)
+
+    Returns:
+        List of rows with their properties
+    """
+    if not is_notion_available():
+        return {"error": "Notion not configured"}
+
+    client = _get_notion_client()
+
+    try:
+        # Build query
+        query: Dict[str, Any] = {"page_size": min(limit, 100)}
+
+        # Add filter if specified
+        if filter_property and filter_value:
+            query["filter"] = {
+                "property": filter_property,
+                "rich_text": {"contains": filter_value}
+            }
+
+        # Add sort if specified
+        if sort_property:
+            query["sorts"] = [{
+                "property": sort_property,
+                "direction": sort_direction
+            }]
+
+        response = await client.post(f"/databases/{database_id}/query", json=query)
+        response.raise_for_status()
+        data = response.json()
+
+        # Format results
+        rows = []
+        for page in data.get("results", []):
+            row = {"id": page["id"]}
+            props = page.get("properties", {})
+
+            for prop_name, prop_data in props.items():
+                prop_type = prop_data.get("type")
+
+                if prop_type == "title":
+                    title_arr = prop_data.get("title", [])
+                    row[prop_name] = "".join(t.get("plain_text", "") for t in title_arr)
+                elif prop_type == "rich_text":
+                    text_arr = prop_data.get("rich_text", [])
+                    row[prop_name] = "".join(t.get("plain_text", "") for t in text_arr)
+                elif prop_type == "number":
+                    row[prop_name] = prop_data.get("number")
+                elif prop_type == "select":
+                    select = prop_data.get("select")
+                    row[prop_name] = select.get("name") if select else None
+                elif prop_type == "multi_select":
+                    row[prop_name] = [s.get("name") for s in prop_data.get("multi_select", [])]
+                elif prop_type == "date":
+                    date = prop_data.get("date")
+                    row[prop_name] = date.get("start") if date else None
+                elif prop_type == "checkbox":
+                    row[prop_name] = prop_data.get("checkbox")
+                elif prop_type == "url":
+                    row[prop_name] = prop_data.get("url")
+                elif prop_type == "email":
+                    row[prop_name] = prop_data.get("email")
+
+            rows.append(row)
+
+        return {
+            "rows": rows,
+            "count": len(rows),
+            "has_more": data.get("has_more", False)
+        }
+
+    except httpx.HTTPError as e:
+        logger.error(f"Notion query failed: {e}")
+        return {"error": str(e)}
+
+
+@tool(
+    name="notion_update_row",
+    description="""Update a row in a Notion database.
+    Use to edit existing entries in a table."""
+)
+async def notion_update_row(
+    row_id: str,
+    properties: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Update a database row.
+
+    Args:
+        row_id: ID of the row (page) to update
+        properties: Properties to update, e.g.:
+                   {"Status": "Done", "Priority": "High"}
+
+    Returns:
+        Status of the update
+    """
+    if not is_notion_available():
+        return {"error": "Notion not configured"}
+
+    client = _get_notion_client()
+
+    try:
+        # Get current page to determine property types
+        page_resp = await client.get(f"/pages/{row_id}")
+        page_resp.raise_for_status()
+        current_props = page_resp.json().get("properties", {})
+
+        # Format properties
+        formatted_props = {}
+        for key, value in properties.items():
+            if key not in current_props:
+                continue
+
+            prop_type = current_props[key].get("type")
+
+            if prop_type == "title":
+                formatted_props[key] = {"title": [{"text": {"content": str(value)}}]}
+            elif prop_type == "rich_text":
+                formatted_props[key] = {"rich_text": [{"text": {"content": str(value)}}]}
+            elif prop_type == "number":
+                formatted_props[key] = {"number": float(value) if value else None}
+            elif prop_type == "select":
+                formatted_props[key] = {"select": {"name": str(value)}}
+            elif prop_type == "multi_select":
+                if isinstance(value, list):
+                    formatted_props[key] = {"multi_select": [{"name": v} for v in value]}
+                else:
+                    formatted_props[key] = {"multi_select": [{"name": str(value)}]}
+            elif prop_type == "date":
+                formatted_props[key] = {"date": {"start": str(value)}}
+            elif prop_type == "checkbox":
+                formatted_props[key] = {"checkbox": bool(value)}
+            elif prop_type == "url":
+                formatted_props[key] = {"url": str(value) if value else None}
+            elif prop_type == "email":
+                formatted_props[key] = {"email": str(value) if value else None}
+
+        response = await client.patch(f"/pages/{row_id}", json={"properties": formatted_props})
+        response.raise_for_status()
+
+        return {"status": "updated", "row_id": row_id}
+
+    except httpx.HTTPError as e:
+        logger.error(f"Notion update row failed: {e}")
         return {"error": str(e)}
