@@ -14,6 +14,9 @@ from tools.memory_tools import (
 # Import HTTP tool for external API calls (Notion, etc.)
 from tools.http import http_request
 
+# Import web tools for search and fetch
+from tools.web import web_search, web_fetch, set_perplexity_key, is_available as web_available
+
 __all__ = [
     "ToolRegistry",
     "ToolDefinition",
@@ -29,4 +32,9 @@ __all__ = [
     "MEMORY_TOOLS",
     # HTTP tool
     "http_request",
+    # Web tools
+    "web_search",
+    "web_fetch",
+    "set_perplexity_key",
+    "web_available",
 ]
