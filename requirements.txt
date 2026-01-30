@@ -19,6 +19,9 @@ supabase>=2.3.0
 # Vector search
 numpy>=1.26.0
 
+# Embeddings
+openai>=1.0.0
+
 # HTTP client
 httpx>=0.26.0
 

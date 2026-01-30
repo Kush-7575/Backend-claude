@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS notes (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id TEXT NOT NULL DEFAULT 'default',
     title VARCHAR(255) NOT NULL,
+    content TEXT,  -- Optional direct content (for simple notes without items)
     type VARCHAR(50) DEFAULT 'collection',  -- 'collection' or 'list'
     pinned BOOLEAN DEFAULT FALSE,
     archived BOOLEAN DEFAULT FALSE,
@@ -41,6 +42,10 @@ CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id);
 CREATE INDEX IF NOT EXISTS idx_notes_deleted ON notes(deleted);
 CREATE INDEX IF NOT EXISTS idx_notes_type ON notes(type);
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at DESC);
+
+-- Full-text search index for notes
+CREATE INDEX IF NOT EXISTS idx_notes_fts ON notes
+    USING gin(to_tsvector('english', COALESCE(title, '') || ' ' || COALESCE(content, '')));
 
 -- ============================================================
 -- 2. NOTE ITEMS (Content within notes)
@@ -113,6 +118,8 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id TEXT NOT NULL DEFAULT 'default',
     title VARCHAR(255),
+    messages JSONB DEFAULT '[]',  -- Array of message objects
+    compaction_count INT DEFAULT 0,  -- Number of times session was compacted
     active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -323,6 +330,46 @@ BEGIN
     WHERE sc.user_id = match_user_id
       AND sc.embedding IS NOT NULL
     ORDER BY sc.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- Function: Search Notes by Text (Full-Text Search)
+-- ============================================================
+CREATE OR REPLACE FUNCTION search_notes_text(
+    search_query TEXT,
+    match_user_id TEXT DEFAULT 'default',
+    match_count INT DEFAULT 10
+)
+RETURNS TABLE (
+    id UUID,
+    note_id UUID,
+    user_id TEXT,
+    title VARCHAR(255),
+    content TEXT,
+    type VARCHAR(50),
+    rank FLOAT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        n.id,
+        n.id as note_id,
+        n.user_id,
+        n.title,
+        n.content,
+        n.type,
+        ts_rank(
+            to_tsvector('english', COALESCE(n.title, '') || ' ' || COALESCE(n.content, '')),
+            plainto_tsquery('english', search_query)
+        )::FLOAT as rank
+    FROM notes n
+    WHERE n.user_id = match_user_id
+      AND n.deleted = FALSE
+      AND to_tsvector('english', COALESCE(n.title, '') || ' ' || COALESCE(n.content, ''))
+          @@ plainto_tsquery('english', search_query)
+    ORDER BY rank DESC
     LIMIT match_count;
 END;
 $$ LANGUAGE plpgsql;
