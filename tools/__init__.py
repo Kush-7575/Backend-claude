@@ -17,6 +17,9 @@ from tools.http import http_request
 # Import web tools for search and fetch
 from tools.web import web_search, web_fetch, set_perplexity_key, is_available as web_available
 
+# Import Notion tools (dedicated, simpler than http_request)
+from tools.notion import notion_search, notion_create_page, notion_append, is_notion_available
+
 __all__ = [
     "ToolRegistry",
     "ToolDefinition",
@@ -37,4 +40,9 @@ __all__ = [
     "web_fetch",
     "set_perplexity_key",
     "web_available",
+    # Notion tools
+    "notion_search",
+    "notion_create_page",
+    "notion_append",
+    "is_notion_available",
 ]
