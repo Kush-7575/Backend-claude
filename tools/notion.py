@@ -4,14 +4,29 @@ Notion Integration Tools
 Tools for creating and searching Notion pages.
 Requires NOTION_API_KEY in environment.
 """
+import json
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 import httpx
 
 from core.config import settings
 from tools.registry import tool
 
 logger = logging.getLogger("brainmap.tools.notion")
+
+
+def _parse_json_if_string(value: Any) -> Any:
+    """Parse JSON string to dict/list if needed.
+
+    The LLM sometimes passes JSON as a string instead of structured data.
+    This ensures we always work with proper Python objects.
+    """
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
 
 
 # Notion API client
@@ -366,7 +381,7 @@ def _content_to_blocks(content: str) -> List[Dict[str, Any]]:
 async def notion_create_database(
     title: str,
     parent_page_id: str,
-    columns: List[Dict[str, str]]
+    columns: Union[List[Dict[str, str]], str]
 ) -> Dict[str, Any]:
     """
     Create a Notion database (table).
@@ -387,6 +402,11 @@ async def notion_create_database(
     """
     if not is_notion_available():
         return {"error": "Notion not configured"}
+
+    # Parse columns if passed as JSON string
+    columns = _parse_json_if_string(columns)
+    if not isinstance(columns, list):
+        return {"error": f"columns must be a list, got {type(columns).__name__}"}
 
     client = _get_notion_client()
 
@@ -458,7 +478,7 @@ async def notion_create_database(
 )
 async def notion_add_row(
     database_id: str,
-    properties: Dict[str, Any]
+    properties: Union[Dict[str, Any], str]
 ) -> Dict[str, Any]:
     """
     Add a row to a Notion database.
@@ -475,6 +495,11 @@ async def notion_add_row(
     """
     if not is_notion_available():
         return {"error": "Notion not configured"}
+
+    # Parse properties if passed as JSON string
+    properties = _parse_json_if_string(properties)
+    if not isinstance(properties, dict):
+        return {"error": f"properties must be a dict, got {type(properties).__name__}"}
 
     client = _get_notion_client()
 
@@ -673,7 +698,7 @@ async def notion_query_database(
 )
 async def notion_update_row(
     row_id: str,
-    properties: Dict[str, Any]
+    properties: Union[Dict[str, Any], str]
 ) -> Dict[str, Any]:
     """
     Update a database row.
@@ -688,6 +713,11 @@ async def notion_update_row(
     """
     if not is_notion_available():
         return {"error": "Notion not configured"}
+
+    # Parse properties if passed as JSON string
+    properties = _parse_json_if_string(properties)
+    if not isinstance(properties, dict):
+        return {"error": f"properties must be a dict, got {type(properties).__name__}"}
 
     client = _get_notion_client()
 
