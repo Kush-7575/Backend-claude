@@ -29,6 +29,22 @@ def _parse_json_if_string(value: Any) -> Any:
     return value
 
 
+def _normalize_id(id_str: str) -> str:
+    """Normalize Notion ID to UUID format with dashes.
+
+    Notion accepts both formats but some endpoints are picky.
+    """
+    # Remove any existing dashes and whitespace
+    clean = id_str.replace("-", "").replace(" ", "").strip()
+
+    # If it's 32 chars (UUID without dashes), add them back
+    if len(clean) == 32:
+        return f"{clean[:8]}-{clean[8:12]}-{clean[12:16]}-{clean[16:20]}-{clean[20:]}"
+
+    # Otherwise return as-is (might be a URL or other format)
+    return id_str
+
+
 # Notion API client
 _notion_client: Optional[httpx.AsyncClient] = None
 
@@ -408,6 +424,9 @@ async def notion_create_database(
     if not isinstance(columns, list):
         return {"error": f"columns must be a list, got {type(columns).__name__}"}
 
+    # Normalize parent page ID
+    parent_page_id = _normalize_id(parent_page_id)
+
     client = _get_notion_client()
 
     try:
@@ -450,7 +469,16 @@ async def notion_create_database(
         }
 
         response = await client.post("/databases", json=db_data)
-        response.raise_for_status()
+
+        if not response.is_success:
+            try:
+                error_data = response.json()
+                error_msg = error_data.get("message", response.text[:200])
+            except:
+                error_msg = response.text[:200]
+            logger.error(f"Notion create database failed: {response.status_code} - {error_msg}")
+            return {"error": f"Notion API error: {error_msg}", "status_code": response.status_code}
+
         data = response.json()
 
         return {
@@ -462,13 +490,7 @@ async def notion_create_database(
 
     except httpx.HTTPError as e:
         logger.error(f"Notion create database failed: {e}")
-        error_detail = ""
-        if hasattr(e, 'response') and e.response is not None:
-            try:
-                error_detail = e.response.json().get("message", "")
-            except:
-                error_detail = e.response.text[:200]
-        return {"error": str(e), "detail": error_detail}
+        return {"error": str(e)}
 
 
 @tool(
