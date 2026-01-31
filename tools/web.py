@@ -4,10 +4,14 @@ Web Search Tools - Fast (Tavily) + Deep Research (Perplexity)
 Two modes:
 - web_search: Fast search using Tavily (~0.5s) - for quick facts
 - web_research: Deep research using Perplexity Sonar (~5s) - for complex questions
+
+Includes LRU caching (like Clawdbot) to prevent duplicate searches.
 """
 import logging
+import time
 import httpx
 from typing import Optional, Dict, Any, List
+from collections import OrderedDict
 
 from core.config import settings
 from tools.registry import tool
@@ -17,6 +21,51 @@ logger = logging.getLogger("brainmap.tools.web")
 # API URLs
 TAVILY_API_URL = "https://api.tavily.com/search"
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
+
+# =============================================================================
+# SEARCH CACHE (from Clawdbot pattern)
+# =============================================================================
+# LRU cache with TTL to prevent duplicate web searches
+# - 15 minute TTL (same query won't hit API again)
+# - Max 100 entries (oldest evicted when full)
+# - Cache key: normalized query + provider
+
+CACHE_TTL_SECONDS = 15 * 60  # 15 minutes
+CACHE_MAX_ENTRIES = 100
+
+_search_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+
+
+def _cache_key(query: str, provider: str) -> str:
+    """Generate normalized cache key."""
+    return f"{provider}:{query.strip().lower()}"
+
+
+def _cache_get(key: str) -> Optional[Dict[str, Any]]:
+    """Get from cache if not expired."""
+    if key not in _search_cache:
+        return None
+
+    entry = _search_cache[key]
+    if time.time() > entry.get("_expires_at", 0):
+        del _search_cache[key]
+        return None
+
+    # Move to end (LRU)
+    _search_cache.move_to_end(key)
+    logger.info(f"Cache HIT for: {key[:50]}...")
+    return entry
+
+
+def _cache_set(key: str, value: Dict[str, Any]) -> None:
+    """Add to cache with TTL."""
+    # Evict oldest if at capacity
+    while len(_search_cache) >= CACHE_MAX_ENTRIES:
+        _search_cache.popitem(last=False)
+
+    value["_expires_at"] = time.time() + CACHE_TTL_SECONDS
+    value["_cached"] = True
+    _search_cache[key] = value
 
 
 def is_search_available() -> bool:
@@ -60,6 +109,12 @@ async def web_search(
     Returns:
         Dict with 'answer', 'results' (title, url, content snippets)
     """
+    # Check cache first (prevents duplicate searches - Clawdbot pattern)
+    cache_key = _cache_key(query, "tavily")
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
     # Fallback to Perplexity if Tavily not configured
     if not settings.TAVILY_API_KEY:
         if settings.PERPLEXITY_API_KEY:
@@ -106,12 +161,16 @@ async def web_search(
 
             logger.info(f"Tavily search: '{query[:40]}...' -> {len(results)} results")
 
-            return {
+            result = {
                 "answer": answer,
                 "results": results,
                 "sources": [r["url"] for r in results[:3]],
                 "provider": "tavily"
             }
+
+            # Cache the result
+            _cache_set(cache_key, result)
+            return result
 
     except httpx.TimeoutException:
         logger.warning("Tavily timeout, trying Perplexity")
@@ -149,13 +208,18 @@ async def web_research(
     Returns:
         Dict with 'answer', 'citations'
     """
+    # Check cache first
+    model = "sonar-pro" if detailed else "sonar"
+    cache_key = _cache_key(f"{query}:{model}", "perplexity")
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
     if not settings.PERPLEXITY_API_KEY:
         return {
             "error": "Deep research not configured",
             "message": "Add PERPLEXITY_API_KEY to .env for research mode"
         }
-
-    model = "sonar-pro" if detailed else "sonar"
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -192,13 +256,17 @@ async def web_research(
 
             logger.info(f"Perplexity research: '{query[:40]}...' -> {len(answer)} chars")
 
-            return {
+            result = {
                 "answer": answer,
                 "citations": citations,
                 "sources": citations[:5],
                 "provider": "perplexity",
                 "model": model
             }
+
+            # Cache the result
+            _cache_set(cache_key, result)
+            return result
 
     except httpx.TimeoutException:
         return {"error": "Research timed out (query may be too complex)"}
