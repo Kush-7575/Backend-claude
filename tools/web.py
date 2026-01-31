@@ -1,75 +1,168 @@
 """
-Web Search Tool - Perplexity Sonar API
+Web Search Tools - Fast (Tavily) + Deep Research (Perplexity)
 
-Provides real-time web search capabilities using Perplexity's Sonar model.
-Returns grounded, citation-backed answers from the internet.
+Two modes:
+- web_search: Fast search using Tavily (~0.5s) - for quick facts
+- web_research: Deep research using Perplexity Sonar (~5s) - for complex questions
 """
 import logging
 import httpx
 from typing import Optional, Dict, Any, List
 
+from core.config import settings
 from tools.registry import tool
 
 logger = logging.getLogger("brainmap.tools.web")
 
-# Perplexity API configuration
+# API URLs
+TAVILY_API_URL = "https://api.tavily.com/search"
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
-PERPLEXITY_MODEL = "sonar"  # Lightweight, fast, cost-effective
-
-_api_key: Optional[str] = None
 
 
-def set_perplexity_key(api_key: str) -> None:
-    """Set the Perplexity API key."""
-    global _api_key
-    _api_key = api_key
+def is_search_available() -> bool:
+    """Check if any search is available."""
+    return bool(settings.TAVILY_API_KEY or settings.PERPLEXITY_API_KEY)
 
 
-def is_available() -> bool:
-    """Check if web search is available."""
-    return _api_key is not None
+def is_tavily_available() -> bool:
+    """Check if Tavily (fast search) is available."""
+    return bool(settings.TAVILY_API_KEY)
+
+
+def is_perplexity_available() -> bool:
+    """Check if Perplexity (deep research) is available."""
+    return bool(settings.PERPLEXITY_API_KEY)
 
 
 @tool(
     name="web_search",
-    description="""Search the web for real-time information using Perplexity AI.
-    
+    description="""Fast web search using Tavily (~0.5s response time).
+
     USE THIS when:
-    - User asks about current events, news, recent releases
-    - User wants factual data you don't have (movie lists, prices, sports scores)
-    - User asks "what are the top/best/latest X"
-    - Any query where your training data might be stale
-    
-    Returns a grounded answer with citations from the web."""
+    - User asks about current events, news, recent data
+    - User wants factual info: prices, scores, lists, rankings
+    - Quick lookups: "what is X", "who is Y", "when did Z happen"
+    - Any query where you need fresh data fast
+
+    For complex research questions requiring synthesis, use web_research instead."""
 )
 async def web_search(
+    query: str,
+    max_results: int = 5
+) -> Dict[str, Any]:
+    """
+    Fast web search using Tavily.
+
+    Args:
+        query: Search query (be specific for better results)
+        max_results: Number of results to return (1-10)
+
+    Returns:
+        Dict with 'answer', 'results' (title, url, content snippets)
+    """
+    # Fallback to Perplexity if Tavily not configured
+    if not settings.TAVILY_API_KEY:
+        if settings.PERPLEXITY_API_KEY:
+            logger.info("Tavily not configured, falling back to Perplexity")
+            return await web_research(query)
+        return {
+            "error": "Web search not configured",
+            "message": "Add TAVILY_API_KEY to .env for fast search"
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                TAVILY_API_URL,
+                json={
+                    "api_key": settings.TAVILY_API_KEY,
+                    "query": query,
+                    "max_results": min(max_results, 10),
+                    "include_answer": True,
+                    "include_raw_content": False,
+                    "search_depth": "basic"  # Fast mode
+                }
+            )
+
+            if response.status_code != 200:
+                logger.error(f"Tavily API error: {response.status_code} - {response.text[:200]}")
+                # Fallback to Perplexity on error
+                if settings.PERPLEXITY_API_KEY:
+                    return await web_research(query)
+                return {"error": f"Search failed: {response.status_code}"}
+
+            data = response.json()
+
+            # Format results
+            results = []
+            for r in data.get("results", []):
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "content": r.get("content", "")[:500]  # Truncate
+                })
+
+            answer = data.get("answer", "")
+
+            logger.info(f"Tavily search: '{query[:40]}...' -> {len(results)} results")
+
+            return {
+                "answer": answer,
+                "results": results,
+                "sources": [r["url"] for r in results[:3]],
+                "provider": "tavily"
+            }
+
+    except httpx.TimeoutException:
+        logger.warning("Tavily timeout, trying Perplexity")
+        if settings.PERPLEXITY_API_KEY:
+            return await web_research(query)
+        return {"error": "Search timed out"}
+    except Exception as e:
+        logger.exception(f"Web search failed: {e}")
+        return {"error": str(e)}
+
+
+@tool(
+    name="web_research",
+    description="""Deep web research using Perplexity Sonar (~5s response time).
+
+    USE THIS when:
+    - Complex questions requiring synthesis from multiple sources
+    - "Compare X vs Y", "What are the pros and cons of..."
+    - Questions needing analysis, not just facts
+    - Following up on web_search for deeper understanding
+
+    For quick factual lookups, use web_search instead (10x faster)."""
+)
+async def web_research(
     query: str,
     detailed: bool = False
 ) -> Dict[str, Any]:
     """
-    Search the web for information.
-    
+    Deep research using Perplexity Sonar.
+
     Args:
-        query: The search query (be specific for better results)
-        detailed: If True, use sonar-pro for more in-depth research
-        
+        query: Research question (can be complex)
+        detailed: If True, use sonar-pro for deeper analysis
+
     Returns:
-        Dict with 'answer', 'citations', and 'sources'
+        Dict with 'answer', 'citations'
     """
-    if not _api_key:
+    if not settings.PERPLEXITY_API_KEY:
         return {
-            "error": "Web search not configured",
-            "message": "Perplexity API key not set. Add PERPLEXITY_API_KEY to .env"
+            "error": "Deep research not configured",
+            "message": "Add PERPLEXITY_API_KEY to .env for research mode"
         }
-    
+
     model = "sonar-pro" if detailed else "sonar"
-    
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 PERPLEXITY_API_URL,
                 headers={
-                    "Authorization": f"Bearer {_api_key}",
+                    "Authorization": f"Bearer {settings.PERPLEXITY_API_KEY}",
                     "Content-Type": "application/json"
                 },
                 json={
@@ -77,131 +170,139 @@ async def web_search(
                     "messages": [
                         {
                             "role": "system",
-                            "content": "Be precise and concise. Provide factual information with specific details like names, dates, and numbers. Format lists clearly."
+                            "content": "Be precise and concise. Provide factual information with specific details. Format lists clearly."
                         },
                         {
                             "role": "user",
                             "content": query
                         }
                     ],
-                    "temperature": 0.0,  # More factual
+                    "temperature": 0.0,
                     "return_citations": True
                 }
             )
-            
+
             if response.status_code != 200:
-                logger.error(f"Perplexity API error: {response.status_code} - {response.text}")
-                return {
-                    "error": f"Search failed: {response.status_code}",
-                    "message": response.text[:200]
-                }
-            
+                logger.error(f"Perplexity error: {response.status_code}")
+                return {"error": f"Research failed: {response.status_code}"}
+
             data = response.json()
-            
-            # Extract the answer
             answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            
-            # Extract citations if available
             citations = data.get("citations", [])
-            
-            logger.info(f"Web search completed: '{query[:50]}...' -> {len(answer)} chars, {len(citations)} citations")
-            
+
+            logger.info(f"Perplexity research: '{query[:40]}...' -> {len(answer)} chars")
+
             return {
                 "answer": answer,
                 "citations": citations,
-                "sources": citations[:5],  # Top 5 sources for display
-                "model_used": model
+                "sources": citations[:5],
+                "provider": "perplexity",
+                "model": model
             }
-            
+
     except httpx.TimeoutException:
-        logger.error(f"Perplexity API timeout for query: {query}")
-        return {
-            "error": "Search timed out",
-            "message": "The web search took too long. Try a simpler query."
-        }
+        return {"error": "Research timed out (query may be too complex)"}
     except Exception as e:
-        logger.exception(f"Web search failed: {e}")
-        return {
-            "error": "Search failed",
-            "message": str(e)
-        }
+        logger.exception(f"Research failed: {e}")
+        return {"error": str(e)}
 
 
 @tool(
     name="web_fetch",
-    description="""Fetch and read content from a specific URL.
-    
+    description="""Fetch and summarize content from a specific URL.
+
     USE THIS when:
     - User shares a URL and asks about its content
     - You need to read a specific webpage
-    - Following up on a citation from web_search
-    
-    Returns the main text content from the URL."""
+    - Following up on a citation from web_search/web_research"""
 )
 async def web_fetch(
-    url: str,
-    extract_type: str = "text"
+    url: str
 ) -> Dict[str, Any]:
     """
-    Fetch content from a URL.
-    
+    Fetch and summarize URL content.
+
     Args:
         url: The URL to fetch
-        extract_type: 'text' for main content, 'full' for everything
-        
+
     Returns:
-        Dict with 'content', 'title', 'url'
+        Dict with 'content', 'url'
     """
-    if not _api_key:
-        return {
-            "error": "Web fetch not configured",
-            "message": "Perplexity API key not set"
-        }
-    
-    # Use Perplexity to summarize the URL content
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                PERPLEXITY_API_URL,
-                headers={
-                    "Authorization": f"Bearer {_api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "sonar",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "Summarize the main content from the provided URL. Extract key information, facts, and details."
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Read and summarize this URL: {url}"
+    # Try Tavily extract first (faster)
+    if settings.TAVILY_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    "https://api.tavily.com/extract",
+                    json={
+                        "api_key": settings.TAVILY_API_KEY,
+                        "urls": [url]
+                    }
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    results = data.get("results", [])
+                    if results:
+                        content = results[0].get("raw_content", "")[:3000]
+                        return {
+                            "content": content,
+                            "url": url,
+                            "provider": "tavily"
                         }
-                    ],
-                    "temperature": 0.0
-                }
-            )
-            
-            if response.status_code != 200:
-                return {
-                    "error": f"Fetch failed: {response.status_code}",
-                    "url": url
-                }
-            
-            data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            
-            return {
-                "content": content,
-                "url": url,
-                "source": "perplexity_sonar"
-            }
-            
-    except Exception as e:
-        logger.exception(f"Web fetch failed for {url}: {e}")
-        return {
-            "error": "Fetch failed",
-            "url": url,
-            "message": str(e)
-        }
+        except Exception as e:
+            logger.warning(f"Tavily extract failed: {e}")
+
+    # Fallback to Perplexity
+    if settings.PERPLEXITY_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    PERPLEXITY_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {settings.PERPLEXITY_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "sonar",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "Summarize the main content from the URL. Extract key facts."
+                            },
+                            {
+                                "role": "user",
+                                "content": f"Read and summarize: {url}"
+                            }
+                        ],
+                        "temperature": 0.0
+                    }
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    return {
+                        "content": content,
+                        "url": url,
+                        "provider": "perplexity"
+                    }
+        except Exception as e:
+            logger.exception(f"Perplexity fetch failed: {e}")
+
+    return {
+        "error": "Could not fetch URL",
+        "url": url,
+        "message": "Configure TAVILY_API_KEY or PERPLEXITY_API_KEY"
+    }
+
+
+# Legacy function for backwards compatibility
+def set_perplexity_key(api_key: str) -> None:
+    """Deprecated: Use settings.PERPLEXITY_API_KEY instead."""
+    pass
+
+
+def is_available() -> bool:
+    """Check if web search is available (any provider)."""
+    return is_search_available()

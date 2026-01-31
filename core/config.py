@@ -107,7 +107,11 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     PERPLEXITY_API_KEY: Optional[str] = Field(
         default=None,
-        description="Perplexity API key for web search (Sonar model)"
+        description="Perplexity API key for deep research (Sonar model)"
+    )
+    TAVILY_API_KEY: Optional[str] = Field(
+        default=None,
+        description="Tavily API key for fast web search (~0.5s)"
     )
     DEEPGRAM_API_KEY: Optional[str] = Field(
         default=None,

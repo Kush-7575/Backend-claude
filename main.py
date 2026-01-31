@@ -69,13 +69,17 @@ async def lifespan(app: FastAPI):
     tool_registry = get_tool_registry()
     logger.info(f"✅ Tool registry initialized ({len(tool_registry._tools)} tools)")
     
-    # Initialize web search if Perplexity key is configured
+    # Log web search providers
+    search_providers = []
+    if settings.TAVILY_API_KEY:
+        search_providers.append("Tavily (fast)")
     if settings.PERPLEXITY_API_KEY:
-        from tools.web import set_perplexity_key
-        set_perplexity_key(settings.PERPLEXITY_API_KEY)
-        logger.info("🔍 Web search enabled (Perplexity Sonar)")
+        search_providers.append("Perplexity (research)")
+
+    if search_providers:
+        logger.info(f"🔍 Web search enabled: {', '.join(search_providers)}")
     else:
-        logger.info("⚠️ Web search disabled (no PERPLEXITY_API_KEY)")
+        logger.info("⚠️ Web search disabled (no TAVILY_API_KEY or PERPLEXITY_API_KEY)")
     
     # Load skills
     from skills.loader import get_skill_loader

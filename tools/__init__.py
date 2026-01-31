@@ -14,8 +14,17 @@ from tools.memory_tools import (
 # Import HTTP tool for external API calls (Notion, etc.)
 from tools.http import http_request
 
-# Import web tools for search and fetch
-from tools.web import web_search, web_fetch, set_perplexity_key, is_available as web_available
+# Import web tools for search (fast) and research (deep)
+from tools.web import (
+    web_search,
+    web_research,
+    web_fetch,
+    is_search_available,
+    is_tavily_available,
+    is_perplexity_available,
+    set_perplexity_key,  # Legacy
+    is_available as web_available  # Legacy
+)
 
 # Import Notion tools (dedicated, simpler than http_request)
 from tools.notion import (
@@ -48,7 +57,11 @@ __all__ = [
     "http_request",
     # Web tools
     "web_search",
+    "web_research",
     "web_fetch",
+    "is_search_available",
+    "is_tavily_available",
+    "is_perplexity_available",
     "set_perplexity_key",
     "web_available",
     # Notion tools
