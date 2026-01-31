@@ -80,6 +80,72 @@ class ContextManager:
         else:
             # Rough approximation: ~4 chars per token
             return len(text) // 4
+
+    def truncate_text_to_tokens(self, text: str, max_tokens: int) -> str:
+        """Truncate text to a maximum number of tokens."""
+        if max_tokens <= 0:
+            return ""
+        if not text:
+            return ""
+        if self._encoding:
+            try:
+                tokens = self._encoding.encode(text)
+                if len(tokens) <= max_tokens:
+                    return text
+                truncated = self._encoding.decode(tokens[:max_tokens])
+                return truncated
+            except Exception:
+                pass
+        # Fallback approximate by chars
+        return text[: max_tokens * 4]
+
+    def soft_trim_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Soft-trim oversized message blocks with head+tail preservation."""
+        max_chars = settings.CONTEXT_SOFT_TRIM_MAX_CHARS
+        if max_chars <= 0:
+            return messages
+
+        head_ratio = settings.CONTEXT_SOFT_TRIM_HEAD_RATIO
+        tail_ratio = settings.CONTEXT_SOFT_TRIM_TAIL_RATIO
+        head_ratio = max(0.0, min(1.0, head_ratio))
+        tail_ratio = max(0.0, min(1.0, tail_ratio))
+        if head_ratio + tail_ratio > 1.0:
+            tail_ratio = max(0.0, 1.0 - head_ratio)
+
+        def trim_text(value: str) -> str:
+            if len(value) <= max_chars:
+                return value
+            head_chars = int(max_chars * head_ratio)
+            tail_chars = int(max_chars * tail_ratio)
+            head = value[:head_chars] if head_chars > 0 else ""
+            tail = value[-tail_chars:] if tail_chars > 0 else ""
+            marker = "\n...[TRUNCATED]...\n"
+            return f"{head}{marker}{tail}".strip()
+
+        trimmed: List[Dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                new_msg = dict(msg)
+                new_msg["content"] = trim_text(content)
+                trimmed.append(new_msg)
+                continue
+            if isinstance(content, list):
+                new_msg = dict(msg)
+                new_blocks = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        new_block = dict(block)
+                        new_block["text"] = trim_text(block.get("text", ""))
+                        new_blocks.append(new_block)
+                    else:
+                        new_blocks.append(block)
+                new_msg["content"] = new_blocks
+                trimmed.append(new_msg)
+                continue
+            trimmed.append(msg)
+
+        return trimmed
     
     def count_message_tokens(self, message: Dict[str, Any]) -> int:
         """

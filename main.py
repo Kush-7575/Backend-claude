@@ -55,6 +55,7 @@ async def lifespan(app: FastAPI):
     from tools.registry import get_tool_registry
     from tools.core import set_dependencies as set_tool_deps
     from tools.memory_tools import set_memory_dependencies
+    import tools.subagents  # Register subagent tools
     from pathlib import Path
 
     # Set dependencies for note tools
@@ -96,6 +97,10 @@ async def lifespan(app: FastAPI):
     from core.agent import get_agent_runner
     agent = get_agent_runner(sessions, tool_registry, prompt_builder)
     logger.info("✅ Agent runner initialized")
+
+    # Wire subagent dependencies
+    from core.subagents import set_subagent_dependencies
+    set_subagent_dependencies(agent, sessions, prompt_builder)
     
     # Wire up routers
     from routers.chat import set_dependencies as set_chat_deps
@@ -106,6 +111,11 @@ async def lifespan(app: FastAPI):
     from routers.voice_stream import set_dependencies as set_voice_deps
     set_voice_deps(agent, sessions)
     logger.info("🎤 Voice router wired")
+
+    # Wire up diagnostics router
+    from routers.diagnostics import set_dependencies as set_diag_deps
+    set_diag_deps(prompt_builder, skill_loader)
+    logger.info("🧭 Diagnostics router wired")
     
     # Start heartbeat scheduler
     if settings.HEARTBEAT_ENABLED:
@@ -173,7 +183,7 @@ from core.rate_limit import RateLimitMiddleware
 app.add_middleware(RateLimitMiddleware, user_header="X-User-ID")
 
 # Import and include routers
-from routers import health, chat, notes, reminders
+from routers import health, chat, notes, reminders, diagnostics
 from routers import voice_stream
 from routers.stubs import (
     today_router, search_router, memories_router,
@@ -185,6 +195,7 @@ app.include_router(chat.router, prefix="/v1/chat", tags=["Chat"])
 app.include_router(notes.router, prefix="/v1/notes", tags=["Notes"])
 app.include_router(reminders.router, prefix="/v1/reminders", tags=["Reminders"])
 app.include_router(voice_stream.router, tags=["Voice"])
+app.include_router(diagnostics.router)
 
 # Stub routers for app compatibility
 app.include_router(today_router)

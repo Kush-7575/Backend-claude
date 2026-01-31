@@ -16,6 +16,7 @@ import random
 from typing import List, Dict, Any, Optional, AsyncIterator, Callable
 from dataclasses import dataclass
 import asyncio
+from datetime import datetime, timezone
 
 from tenacity import (
     retry,
@@ -36,6 +37,7 @@ from core.errors import (
     is_retryable
 )
 from core.lanes import session_lane, global_lane
+from tools.policy import get_tool_policy
 
 logger = logging.getLogger("brainmap.agent")
 
@@ -343,6 +345,187 @@ class AgentRunner:
         self._client = None
         # Message deduplication (from Clawdbot)
         self._deduplicator = MessageDeduplicator()
+        # Agent lifecycle hooks (from Clawdbot)
+        self._pre_hooks: List[Callable] = []
+        self._post_hooks: List[Callable] = []
+
+    def add_pre_hook(self, hook: Callable) -> None:
+        """Register a pre-turn hook (may modify user_message)."""
+        self._pre_hooks.append(hook)
+
+    def add_post_hook(self, hook: Callable) -> None:
+        """Register a post-turn hook."""
+        self._post_hooks.append(hook)
+
+    async def _run_pre_hooks(self, session: Session, user_message: str) -> str:
+        """Run pre-turn hooks, allowing message modification."""
+        msg = user_message
+        for hook in self._pre_hooks:
+            try:
+                if asyncio.iscoroutinefunction(hook):
+                    result = await hook(session=session, user_message=msg)
+                else:
+                    result = hook(session=session, user_message=msg)
+                if isinstance(result, str) and result.strip():
+                    msg = result
+            except Exception as e:
+                logger.warning(f"Pre-hook failed: {e}")
+        return msg
+
+    async def _run_post_hooks(
+        self,
+        session: Session,
+        user_message: str,
+        assistant_response: str
+    ) -> None:
+        """Run post-turn hooks."""
+        for hook in self._post_hooks:
+            try:
+                if asyncio.iscoroutinefunction(hook):
+                    await hook(session=session, user_message=user_message, assistant_response=assistant_response)
+                else:
+                    hook(session=session, user_message=user_message, assistant_response=assistant_response)
+            except Exception as e:
+                logger.warning(f"Post-hook failed: {e}")
+
+    def _resolve_tool_definitions(self, session: Session) -> Optional[List[Dict[str, Any]]]:
+        """Resolve tool definitions filtered by policy for this user."""
+        if not self._tools:
+            return None
+        policy = get_tool_policy()
+        allowlist = set(policy.resolve(session.user_id))
+        return self._tools.get_tool_definitions(allowlist=allowlist)
+
+    def _should_prefetch_memory(self, user_message: str) -> bool:
+        """Heuristic check for past-info queries that should prefetch memory."""
+        if not settings.MEMORY_PREFETCH_ENABLED:
+            return False
+
+        text = user_message.strip().lower()
+        if len(text) < settings.MEMORY_PREFETCH_MIN_CHARS:
+            return False
+        if len(text) > settings.MEMORY_PREFETCH_MAX_CHARS:
+            return True
+        if "memory_search" in text or "search notes" in text:
+            return False
+        if text in {"hi", "hey", "hello", "yo", "sup", "wassup", "what's up"}:
+            return False
+
+        patterns = [
+            r"\bremember\b",
+            r"\bremind me\b",
+            r"\blast time\b",
+            r"\bearlier\b",
+            r"\bprevious\b",
+            r"\bwhat did we\b",
+            r"\bwhat were we\b",
+            r"\bwhat have we\b",
+            r"\bwe discussed\b",
+            r"\byou said\b",
+            r"\bmy (?:favorite|preference|preferences)\b",
+            r"\bdo i have\b",
+            r"\bmy notes?\b",
+            r"\bnotes? about\b",
+            r"\btasks?\b",
+            r"\btodos?\b",
+            r"\breminders?\b",
+            r"\bmeeting\b",
+            r"\bappointment\b",
+            r"\bschedule\b",
+            r"\bcalendar\b",
+        ]
+        for pattern in patterns:
+            if re.search(pattern, text):
+                return True
+        return "?" in text and any(
+            kw in text for kw in ("past", "previous", "earlier", "last", "before")
+        )
+
+    def _resolve_prompt_mode(self, user_message: str) -> str:
+        """Resolve prompt mode for this turn (full/minimal/none)."""
+        if settings.PROMPT_MINIMAL_ON_SHORT:
+            max_chars = max(1, int(settings.PROMPT_MINIMAL_MAX_CHARS))
+            if len(user_message.strip()) <= max_chars:
+                return "minimal"
+        return "full"
+
+    def _truncate_tool_output(self, value: str) -> str:
+        """Truncate tool output for streaming payloads."""
+        max_chars = max(0, int(settings.STREAM_TOOL_OUTPUT_MAX_CHARS))
+        if max_chars <= 0 or len(value) <= max_chars:
+            return value
+        return value[:max_chars] + "..."
+
+    def _prune_tool_results_in_messages(
+        self,
+        messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Trim oversized tool_result blocks to keep prompts small."""
+        hard_clear_min = max(0, int(settings.CONTEXT_PRUNE_HARD_CLEAR_MIN_CHARS))
+        placeholder = settings.CONTEXT_PRUNE_HARD_CLEAR_PLACEHOLDER
+        if hard_clear_min <= 0:
+            return messages
+
+        pruned: List[Dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                pruned.append(msg)
+                continue
+            new_blocks = []
+            changed = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    raw = block.get("content", "")
+                    if isinstance(raw, str) and len(raw) > hard_clear_min:
+                        new_block = dict(block)
+                        new_block["content"] = placeholder
+                        new_blocks.append(new_block)
+                        changed = True
+                        continue
+                new_blocks.append(block)
+            if changed:
+                new_msg = dict(msg)
+                new_msg["content"] = new_blocks
+                pruned.append(new_msg)
+            else:
+                pruned.append(msg)
+        return pruned
+    async def _prefetch_memory(self, user_message: str) -> Optional[str]:
+        """Prefetch memory_search results and format for prompt injection."""
+        if not self._should_prefetch_memory(user_message):
+            return None
+        try:
+            from tools.memory_tools import memory_search
+            result = await memory_search(
+                query=user_message,
+                max_results=5,
+                min_score=0.3
+            )
+        except Exception as e:
+            logger.warning(f"Auto memory_search failed: {e}")
+            return None
+
+        if not isinstance(result, dict) or not result.get("success"):
+            return None
+        results = result.get("results") or []
+        if not results:
+            return None
+
+        lines = ["Memory search results (auto):", f"Query: {user_message}", "Results:"]
+        for idx, item in enumerate(results[:5], start=1):
+            source = item.get("source", "unknown")
+            title = item.get("title") or item.get("path") or ""
+            content = item.get("content") or item.get("text") or ""
+            snippet = " ".join(content.split())
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
+            if title:
+                lines.append(f"{idx}. [{source}] {title} - {snippet}")
+            else:
+                lines.append(f"{idx}. [{source}] {snippet}")
+
+        return "\n".join(lines)
 
     async def _auto_capture_memory(
         self,
@@ -414,40 +597,88 @@ class AgentRunner:
         Returns:
             AgentResponse with content and tool calls
         """
-        # Add user message to session
-        await self._session.add_message(session, "user", user_message)
+        # Use session lane to prevent concurrent requests to same session
+        async with session_lane(session.id, f"run:{user_message[:20]}"):
+            # Pre-turn hooks
+            user_message = await self._run_pre_hooks(session, user_message)
+
+            # Add user message to session
+            await self._session.add_message(session, "user", user_message)
+
+            session.metadata.setdefault("lifecycle_events", []).append({
+                "phase": "start",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+            # Clawdbot-style: do not auto-prefetch memory into the prompt
         
-        # Get messages for API
-        messages = session.get_api_messages()
+            # Get messages for API
+            raw_messages = session.get_api_messages(prune=settings.CONTEXT_PRUNE_ENABLED)
         
-        # Check context and truncate if needed
-        if self._context.needs_compaction(messages):
-            logger.warning("Context needs compaction - truncating for now")
-            messages = self._context.truncate_to_fit(messages)
+            # Check context and truncate if needed
+            if self._context.needs_compaction(raw_messages):
+                logger.warning("Context needs compaction - truncating for now")
+                raw_messages = self._context.truncate_to_fit(raw_messages)
+
+            # Soft-trim oversized message blocks (Clawdbot-like pruning)
+            messages = self._context.soft_trim_messages(raw_messages)
         
-        # Build system prompt if not provided
-        if system_prompt is None and self._prompt:
-            system_prompt = await self._prompt.build(session.user_id)
-        system_prompt = system_prompt or self._default_system_prompt()
+            # Build system prompt if not provided
+            prompt_report = None
+            if system_prompt is None and self._prompt:
+                prompt_mode = self._resolve_prompt_mode(user_message)
+                if hasattr(self._prompt, "build_with_report"):
+                    report = await self._prompt.build_with_report(
+                        session.user_id,
+                        context={"last_message": user_message, "skip_memory": True},
+                        mode=prompt_mode
+                    )
+                    system_prompt = report.get("prompt", "")
+                    prompt_report = report
+                else:
+                    system_prompt = await self._prompt.build(
+                        session.user_id,
+                        context={"last_message": user_message, "skip_memory": True},
+                        mode=prompt_mode
+                    )
+            system_prompt = system_prompt or self._default_system_prompt()
         
-        # Get tools if not provided
-        if tools is None and self._tools:
-            tools = self._tools.get_tool_definitions()
+            # Get tools if not provided
+            if tools is None and self._tools:
+                tools = self._resolve_tool_definitions(session)
         
-        # Make API call with retry
-        response = await self._call_claude_with_retry(
-            messages=messages,
-            system=system_prompt,
-            tools=tools
-        )
-        
-        # Add assistant response to session
-        if response.content:
-            await self._session.add_message(
-                session, "assistant", response.content
+            # Make API call with retry
+            response = await self._call_claude_with_retry(
+                messages=messages,
+                system=system_prompt,
+                tools=tools
             )
         
-        return response
+            # Add assistant response to session
+            if response.content:
+                await self._session.add_message(
+                    session, "assistant", response.content
+                )
+
+            if prompt_report:
+                session.metadata["last_prompt_report"] = prompt_report
+
+            if response.usage:
+                session.metadata["last_cache_stats"] = {
+                    "input_tokens": response.usage.get("input_tokens"),
+                    "output_tokens": response.usage.get("output_tokens"),
+                    "cache_read_tokens": response.usage.get("cache_read_tokens"),
+                    "cache_write_tokens": response.usage.get("cache_write_tokens")
+                }
+
+            await self._run_post_hooks(session, user_message, response.content or "")
+
+            session.metadata.setdefault("lifecycle_events", []).append({
+                "phase": "end",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+        
+            return response
     
     async def run_stream(
         self,
@@ -493,43 +724,89 @@ class AgentRunner:
         the session lock. DO NOT acquire additional session locks here to
         avoid deadlock (asyncio.Lock is not reentrant).
         """
+        # Pre-turn hooks
+        user_message = await self._run_pre_hooks(session, user_message)
+
         # Add user message (auto_compact=False, we'll handle compaction manually for streaming)
         # Note: No nested lock needed - we're already inside session_lane
         await self._session.add_message(session, "user", user_message, auto_compact=False)
 
+        session.metadata.setdefault("lifecycle_events", []).append({
+            "phase": "start",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+        yield StreamChunk(
+            type="lifecycle",
+            content="start",
+            metadata={"phase": "start"}
+        )
+
+        # Clawdbot-style: do not auto-prefetch memory into the prompt
+
         # Get messages for API
-        messages = session.get_api_messages()
+        raw_messages = session.get_api_messages(prune=settings.CONTEXT_PRUNE_ENABLED)
 
         # Check if compaction is needed - trigger FULL compaction, not just truncation
         # This is critical: streaming mode must also flush to memory and summarize
         # Note: We already hold session lock, only acquire global lane for compaction
-        if self._context.needs_compaction(messages):
+        if self._context.needs_compaction(raw_messages):
             logger.info("Context needs compaction before stream - triggering full compaction")
             try:
                 # Only acquire global lane (we already have session lock)
                 async with global_lane("compaction"):
+                    yield StreamChunk(
+                        type="lifecycle",
+                        content="compaction_start",
+                        metadata={"phase": "compaction_start"}
+                    )
                     # Trigger the proper compaction flow (flush to memory + summarize)
                     await self._session._compact_session(session)
                 # Refresh messages after compaction
-                messages = session.get_api_messages()
-                logger.info(f"Compaction complete, now have {len(messages)} messages")
+                raw_messages = session.get_api_messages()
+                logger.info(f"Compaction complete, now have {len(raw_messages)} messages")
+                yield StreamChunk(
+                    type="lifecycle",
+                    content="compaction_end",
+                    metadata={"phase": "compaction_end"}
+                )
             except Exception as e:
                 logger.error(f"Compaction failed, falling back to truncation: {e}")
-                messages = self._context.truncate_to_fit(messages)
+                raw_messages = self._context.truncate_to_fit(raw_messages)
+
+        # Soft-trim oversized message blocks (Clawdbot-like pruning)
+        messages = self._context.soft_trim_messages(raw_messages)
+        messages = self._prune_tool_results_in_messages(messages)
         
         # Build system prompt with context for memory retrieval
+        prompt_report = None
         if system_prompt is None and self._prompt:
+            prompt_mode = self._resolve_prompt_mode(user_message)
             # Pass the user message for memory context retrieval
             prompt_context = {
                 "last_message": user_message,
-                "channel": "stream"
+                "channel": "stream",
+                "skip_memory": True
             }
-            system_prompt = await self._prompt.build(session.user_id, context=prompt_context)
+            if hasattr(self._prompt, "build_with_report"):
+                report = await self._prompt.build_with_report(
+                    session.user_id,
+                    context=prompt_context,
+                    mode=prompt_mode
+                )
+                system_prompt = report.get("prompt", "")
+                prompt_report = report
+            else:
+                system_prompt = await self._prompt.build(
+                    session.user_id,
+                    context=prompt_context,
+                    mode=prompt_mode
+                )
         system_prompt = system_prompt or self._default_system_prompt()
         
         # Get tools
         if tools is None and self._tools:
-            tools = self._tools.get_tool_definitions()
+            tools = self._resolve_tool_definitions(session)
         
         full_response = []
         
@@ -559,8 +836,10 @@ class AgentRunner:
                 break_preference="paragraph"  # Preserve markdown boundaries (lists, paragraphs)
             )
             
+            last_streamed_norm: Optional[str] = None
             while iteration < max_iterations:
                 iteration += 1
+                messages = self._prune_tool_results_in_messages(messages)
                 tool_calls = []
                 current_response = []
                 stop_reason = None
@@ -589,6 +868,11 @@ class AgentRunner:
                                     logger.info(f"✅ CACHE HIT! {cache_read} tokens from cache")
                                 elif cache_write > 0:
                                     logger.info(f"📝 Cache created: {cache_write} tokens")
+                                session.metadata["last_cache_stats"] = {
+                                    "input_tokens": input_tokens,
+                                    "cache_read_tokens": cache_read,
+                                    "cache_write_tokens": cache_write
+                                }
                         
                         elif event.type == "content_block_delta":
                             delta_type = getattr(event.delta, 'type', 'unknown')
@@ -603,6 +887,11 @@ class AgentRunner:
                                     for chunk in chunker.process(text):
                                         # Apply human delay between chunks (not first)
                                         await apply_human_delay(is_first_chunk=(len(full_response) == 1))
+                                        if settings.STREAM_DEDUPLICATE_CHUNKS:
+                                            norm = normalize_text_for_comparison(chunk)
+                                            if norm and norm == last_streamed_norm:
+                                                continue
+                                            last_streamed_norm = norm or last_streamed_norm
                                         yield StreamChunk(type="text", content=chunk)
                             
                             elif delta_type == "input_json_delta":
@@ -646,6 +935,11 @@ class AgentRunner:
                     # Flush any remaining buffered content with human delay
                     for chunk in chunker.flush():
                         await apply_human_delay(is_first_chunk=False)
+                        if settings.STREAM_DEDUPLICATE_CHUNKS:
+                            norm = normalize_text_for_comparison(chunk)
+                            if norm and norm == last_streamed_norm:
+                                continue
+                            last_streamed_norm = norm or last_streamed_norm
                         yield StreamChunk(type="text", content=chunk)
                     # No tools called or Claude finished - we're done!
                     break
@@ -656,10 +950,15 @@ class AgentRunner:
                     logger.info(f"🔧 Executing tool: {tool['name']}")
 
                     # Execute tool
+                    tool_context = {"user_id": session.user_id, "session_id": session.id}
                     if tool_handler:
                         result = await tool_handler(tool["name"], tool["input"])
                     elif self._tools:
-                        result_dict = await self._tools.execute(tool["name"], tool["input"])
+                        result_dict = await self._tools.execute(
+                            tool["name"],
+                            tool["input"],
+                            context=tool_context,
+                        )
                         if result_dict.get("status") == "success":
                             result = result_dict.get("result", "Done")
                         else:
@@ -680,9 +979,12 @@ class AgentRunner:
                     # Fable expects: {id, type, title, entity_id, preview}
                     action_metadata = self._build_action_metadata(tool["name"], result)
 
+                    stream_output = ""
+                    if settings.STREAM_TOOL_OUTPUT_ENABLED:
+                        stream_output = self._truncate_tool_output(result_str)
                     yield StreamChunk(
                         type="tool_end",
-                        content=result_str,
+                        content=stream_output,
                         metadata=action_metadata
                     )
                     
@@ -726,6 +1028,11 @@ class AgentRunner:
             # Final flush of any remaining buffered content with human delay
             for chunk in chunker.flush():
                 await apply_human_delay(is_first_chunk=False)
+                if settings.STREAM_DEDUPLICATE_CHUNKS:
+                    norm = normalize_text_for_comparison(chunk)
+                    if norm and norm == last_streamed_norm:
+                        continue
+                    last_streamed_norm = norm or last_streamed_norm
                 yield StreamChunk(type="text", content=chunk)
 
             # Auto memory capture (from Clawdbot lifecycle hooks)
@@ -734,6 +1041,22 @@ class AgentRunner:
                 session=session,
                 user_message=user_message,
                 assistant_response=response_text
+            )
+
+            if prompt_report:
+                session.metadata["last_prompt_report"] = prompt_report
+
+            await self._run_post_hooks(session, user_message, response_text)
+
+            session.metadata.setdefault("lifecycle_events", []).append({
+                "phase": "end",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+            yield StreamChunk(
+                type="lifecycle",
+                content="end",
+                metadata={"phase": "end"}
             )
 
             yield StreamChunk(type="done", content="")
@@ -806,13 +1129,24 @@ class AgentRunner:
         action = {
             "id": str(uuid4()),
             "type": tool_name,
-            "tool": tool_name  # Keep for backwards compatibility
+            "tool": tool_name,  # Keep for backwards compatibility
+            "title": "",
+            "entity_id": "",
+            "preview": "",
+            "status": "",
+            "success": True
         }
 
         # Extract details from result if it's a dict
         if isinstance(result, dict):
             # Map tool status to action type
             status = result.get("status", "")
+            success = result.get("success", None)
+            if status in ("error", "failed"):
+                action["success"] = False
+            if success is False:
+                action["success"] = False
+            action["status"] = status or ("error" if not action["success"] else "ok")
             if tool_name == "smart_save" or tool_name == "save_note":
                 if status == "created":
                     action["type"] = "note_created"
@@ -824,8 +1158,18 @@ class AgentRunner:
             elif tool_name == "create_reminder":
                 action["type"] = "reminder_created"
 
+            elif tool_name == "append_to_note":
+                action["type"] = "note_appended"
+            elif tool_name == "delete_note":
+                action["type"] = "note_deleted"
+            elif tool_name == "complete_reminder":
+                action["type"] = "reminder_completed"
             elif tool_name == "search_notes":
-                action["type"] = "search_completed"
+                action["type"] = "notes_searched"
+            elif tool_name == "memory_search":
+                action["type"] = "memory_searched"
+            elif tool_name.startswith("web_"):
+                action["type"] = "web_searched"
 
             # Extract common fields
             if "note_id" in result:
@@ -837,11 +1181,20 @@ class AgentRunner:
 
             if "title" in result:
                 action["title"] = result["title"]
+            elif "task" in result:
+                action["title"] = result["task"]
+            elif "topic" in result:
+                action["title"] = result["topic"]
 
             if "content" in result:
                 action["preview"] = result["content"][:100]
             elif "message" in result:
                 action["preview"] = result["message"][:100]
+            elif "results" in result and isinstance(result["results"], list):
+                action["preview"] = f"Found {len(result['results'])} results"
+
+        elif isinstance(result, list):
+            action["preview"] = f"Found {len(result)} results"
 
         return action
 

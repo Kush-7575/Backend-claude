@@ -453,7 +453,14 @@ async def process_transcript_with_agent(
     Process the final transcript using Claude Agent.
     Sends WebSocket messages for status and response.
     """
-    await websocket.send_json({
+    async def safe_send_json(data: dict) -> bool:
+        try:
+            await websocket.send_json(data)
+            return True
+        except Exception:
+            return False
+
+    await safe_send_json({
         "type": "processing",
         "transcript": transcript,
         "message": "Thinking..."
@@ -462,14 +469,14 @@ async def process_transcript_with_agent(
     try:
         if _agent_runner is None or _session_manager is None:
             # Fallback: just echo transcript
-            await websocket.send_json({
+            await safe_send_json({
                 "type": "chat_response",
                 "transcript": transcript,
                 "ai_response": f"I heard: {transcript}",
                 "actions": [],
                 "responded": True
             })
-            await websocket.send_json({
+            await safe_send_json({
                 "type": "complete",
                 "transcript": transcript,
                 "responded": True
@@ -491,14 +498,18 @@ async def process_transcript_with_agent(
         async for chunk in _agent_runner.run_stream(session, transcript):
             if chunk.type == "text":
                 full_response.append(chunk.content)
+                await safe_send_json({
+                    "type": "ai_chunk",
+                    "content": chunk.content
+                })
             elif chunk.type == "tool_start":
-                await websocket.send_json({
+                await safe_send_json({
                     "type": "thinking",
                     "message": f"Using {chunk.content}..."
                 })
             elif chunk.type == "tool_end":
                 if chunk.metadata:
-                    await websocket.send_json({
+                    await safe_send_json({
                         "type": "action",
                         "action": chunk.metadata
                     })
@@ -506,7 +517,7 @@ async def process_transcript_with_agent(
         
         response_text = "".join(full_response)
         
-        await websocket.send_json({
+        await safe_send_json({
             "type": "chat_response",
             "transcript": transcript,
             "ai_response": response_text or "Done!",
@@ -515,7 +526,7 @@ async def process_transcript_with_agent(
             "responded": True
         })
         
-        await websocket.send_json({
+        await safe_send_json({
             "type": "complete",
             "transcript": transcript,
             "responded": True
@@ -526,7 +537,7 @@ async def process_transcript_with_agent(
     
     except Exception as e:
         logger.error(f"Agent processing error: {e}")
-        await websocket.send_json({
+        await safe_send_json({
             "type": "error",
             "message": str(e)
         })

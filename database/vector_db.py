@@ -18,8 +18,9 @@ from typing import List, Optional, Dict, Any
 logger = logging.getLogger("brainmap.vector_db")
 
 # Hybrid search weights from Clawdbot (hybrid.ts)
-HYBRID_VECTOR_WEIGHT = 0.7
-HYBRID_TEXT_WEIGHT = 0.3
+from core.config import settings
+HYBRID_VECTOR_WEIGHT = settings.HYBRID_VECTOR_WEIGHT
+HYBRID_TEXT_WEIGHT = settings.HYBRID_TEXT_WEIGHT
 
 # =============================================================================
 # Embedding Cache (avoid duplicate API calls)
@@ -407,7 +408,9 @@ def search_notes_hybrid(
     query: str,
     user_id: str = None,
     limit: int = 10,
-    min_score: float = 0.3
+    min_score: float = 0.3,
+    vector_weight: Optional[float] = None,
+    text_weight: Optional[float] = None
 ) -> List[Dict[str, Any]]:
     """
     Hybrid search combining vector and keyword search (from Clawdbot).
@@ -449,6 +452,8 @@ def search_notes_hybrid(
     merged = merge_hybrid_results(
         vector_results=vector_results,
         keyword_results=keyword_results,
+        vector_weight=HYBRID_VECTOR_WEIGHT if vector_weight is None else vector_weight,
+        text_weight=HYBRID_TEXT_WEIGHT if text_weight is None else text_weight,
         limit=limit * 2  # Get more to filter by score
     )
 

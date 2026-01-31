@@ -129,9 +129,55 @@ class Session:
         self.updated_at = datetime.now(timezone.utc)
         return msg
     
-    def get_api_messages(self) -> List[Dict[str, Any]]:
-        """Get messages in API format."""
-        return [msg.to_dict() for msg in self.messages]
+    def get_api_messages(
+        self,
+        prune: bool = False,
+        now: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """Get messages in API format, optionally pruning stale system/tool entries."""
+        if not prune:
+            return [msg.to_dict() for msg in self.messages]
+
+        current_time = now or datetime.now(timezone.utc)
+        ttl_seconds = max(0, int(settings.CONTEXT_PRUNE_TTL_SECONDS))
+        hard_clear_min = max(0, int(settings.CONTEXT_PRUNE_HARD_CLEAR_MIN_CHARS))
+        placeholder = settings.CONTEXT_PRUNE_HARD_CLEAR_PLACEHOLDER
+
+        prunable_types = {"memory_search", "tool_result", "tool_output", "subagent_result"}
+        pruned: List[Dict[str, Any]] = []
+
+        for msg in self.messages:
+            meta_type = (msg.metadata or {}).get("type")
+            is_prunable = msg.role == "system" and meta_type in prunable_types
+            msg_age = (current_time - msg.timestamp).total_seconds()
+            if is_prunable and ttl_seconds > 0:
+                if msg_age > ttl_seconds:
+                    continue
+
+            content = msg.content
+            if isinstance(content, list):
+                new_blocks = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        raw = block.get("content", "")
+                        if ttl_seconds > 0 and msg_age > ttl_seconds:
+                            new_block = dict(block)
+                            new_block["content"] = placeholder
+                            new_blocks.append(new_block)
+                            continue
+                        if isinstance(raw, str) and hard_clear_min > 0 and len(raw) > hard_clear_min:
+                            new_block = dict(block)
+                            new_block["content"] = placeholder
+                            new_blocks.append(new_block)
+                            continue
+                    new_blocks.append(block)
+                content = new_blocks
+            if is_prunable and hard_clear_min > 0 and len(content) > hard_clear_min:
+                content = placeholder
+
+            pruned.append({"role": msg.role, "content": content})
+
+        return pruned
     
     def to_storage(self) -> Dict[str, Any]:
         """Convert to storage format."""
@@ -181,6 +227,124 @@ class SessionManager:
         self._sessions_cache[session.id] = session
         logger.info(f"Created session {session.id} for user {user_id}")
         return session
+
+    async def list_sessions(self, user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """List recent sessions for a user."""
+        if self._supabase:
+            try:
+                result = (
+                    self._supabase.table("chat_sessions")
+                    .select("id, title, created_at, updated_at, compaction_count")
+                    .eq("user_id", user_id)
+                    .order("updated_at", desc=True)
+                    .limit(limit)
+                    .execute()
+                )
+                return result.data or []
+            except Exception as e:
+                logger.error(f"Failed to list sessions: {e}")
+
+        # Fallback to cache
+        sessions = [
+            s for s in self._sessions_cache.values() if s.user_id == user_id
+        ]
+        sessions.sort(key=lambda s: s.updated_at, reverse=True)
+        return [
+            {
+                "id": s.id,
+                "title": s.title,
+                "created_at": s.created_at.isoformat(),
+                "updated_at": s.updated_at.isoformat(),
+                "compaction_count": s.compaction_count,
+            }
+            for s in sessions[:limit]
+        ]
+
+    async def list_sessions_summary(self, user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """List lightweight session summaries for a user."""
+        if self._supabase:
+            try:
+                result = (
+                    self._supabase.table("chat_sessions")
+                    .select("id, title, updated_at")
+                    .eq("user_id", user_id)
+                    .order("updated_at", desc=True)
+                    .limit(limit)
+                    .execute()
+                )
+                return result.data or []
+            except Exception as e:
+                logger.error(f"Failed to list session summaries: {e}")
+
+        sessions = [
+            s for s in self._sessions_cache.values() if s.user_id == user_id
+        ]
+        sessions.sort(key=lambda s: s.updated_at, reverse=True)
+        return [
+            {
+                "id": s.id,
+                "title": s.title,
+                "updated_at": s.updated_at.isoformat(),
+            }
+            for s in sessions[:limit]
+        ]
+
+    async def delete_session(self, session_id: str, user_id: str) -> bool:
+        """Delete a session from storage."""
+        self._sessions_cache.pop(session_id, None)
+        if not self._supabase:
+            return True
+        try:
+            result = (
+                self._supabase.table("chat_sessions")
+                .delete()
+                .eq("id", session_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            return bool(result.data)
+        except Exception as e:
+            logger.error(f"Failed to delete session {session_id}: {e}")
+            return False
+
+    async def get_session_status(self, session: Session) -> Dict[str, Any]:
+        """Get a summary status for a session."""
+        metrics = self.get_context_metrics(session)
+        return {
+            "id": session.id,
+            "title": session.title,
+            "message_count": len(session.messages),
+            "compaction_count": session.compaction_count,
+            "context": {
+                "total_tokens": metrics.total_tokens,
+                "max_tokens": metrics.max_tokens,
+                "usage_percent": round(metrics.usage_percent, 2),
+                "needs_compaction": metrics.needs_compaction,
+            },
+            "updated_at": session.updated_at.isoformat(),
+            "last_prompt_report": session.metadata.get("last_prompt_report"),
+            "last_cache_stats": session.metadata.get("last_cache_stats"),
+            "lifecycle_events": session.metadata.get("lifecycle_events", []),
+        }
+
+    async def search_session_history(
+        self,
+        query: str,
+        user_id: str,
+        limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Search past session history via memory manager embeddings."""
+        if not self._memory_manager:
+            return []
+        try:
+            return await self._memory_manager.search_sessions(
+                query=query,
+                user_id=user_id,
+                limit=limit
+            )
+        except Exception as e:
+            logger.error(f"Session history search failed: {e}")
+            return []
     
     async def load_session(self, session_id: str, user_id: str) -> Optional[Session]:
         """Load a session from storage or cache."""

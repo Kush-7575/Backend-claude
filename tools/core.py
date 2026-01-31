@@ -12,6 +12,7 @@ These implement the "Smart Save" pattern from the existing BrainMap.
 """
 import logging
 from typing import Optional, List, Dict, Any
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 import re
@@ -29,6 +30,9 @@ logger = logging.getLogger("brainmap.tools.core")
 _supabase = None
 _memory_manager = None
 
+# Skills directory (used by skill_read)
+SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"
+
 
 def set_dependencies(supabase_client=None, memory_manager=None):
     """Set dependencies for tools."""
@@ -42,6 +46,29 @@ def _get_supabase():
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized")
     return _supabase
+
+
+def _resolve_skill_path(location: str) -> Optional[Path]:
+    """Resolve a skill location to a safe SKILL.md path."""
+    if not location:
+        return None
+    raw = location.strip()
+    # Allow "skill name" shortcut.
+    if "/" not in raw and "\\" not in raw and not raw.lower().endswith(".md"):
+        candidate = SKILLS_DIR / raw / "SKILL.md"
+    else:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = SKILLS_DIR / candidate
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        return None
+    if SKILLS_DIR not in resolved.parents:
+        return None
+    if resolved.name.lower() != "skill.md":
+        return None
+    return resolved
 
 
 # =============================================================================
@@ -235,7 +262,10 @@ async def save_note(
 )
 async def search_notes(
     query: str,
-    limit: int = 5
+    limit: int = 5,
+    min_score: float = 0.3,
+    vector_weight: Optional[float] = None,
+    text_weight: Optional[float] = None
 ) -> List[Dict[str, Any]]:
     """
     Search notes using hybrid search (vector + keyword).
@@ -250,7 +280,9 @@ async def search_notes(
         results = search_notes_hybrid(
             query=query,
             limit=limit,
-            min_score=0.3  # Lower threshold for search, user wants broad results
+            min_score=min_score,  # Lower threshold for search, user wants broad results
+            vector_weight=vector_weight,
+            text_weight=text_weight
         )
 
         notes = []
@@ -347,6 +379,23 @@ async def append_to_note(
     }).eq("id", note_id).execute()
     
     return {"status": "appended", "note_id": note_id}
+
+
+@tool(
+    name="skill_read",
+    description="""Read a skill's SKILL.md file. Use only after selecting a skill
+    from the available_skills list in the system prompt."""
+)
+async def skill_read(location: str) -> Dict[str, Any]:
+    """Read the contents of a skill's SKILL.md file."""
+    path = _resolve_skill_path(location)
+    if not path or not path.exists():
+        return {"status": "error", "message": "Skill file not found", "location": location}
+    try:
+        content = path.read_text(encoding="utf-8")
+        return {"status": "ok", "location": str(path), "content": content}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "location": str(path)}
 
 
 @tool(

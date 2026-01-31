@@ -476,6 +476,8 @@ class MemoryManager:
         sources: Optional[List[str]] = None,
         limit: int = 10,
         use_hybrid: bool = True,
+        vector_weight: Optional[float] = None,
+        text_weight: Optional[float] = None,
         user_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
@@ -507,7 +509,12 @@ class MemoryManager:
         # Search notes - use hybrid vector search if available
         if "notes" in sources:
             if use_hybrid:
-                note_results = await self._search_notes_hybrid(query, limit)
+                note_results = await self._search_notes_hybrid(
+                    query,
+                    limit,
+                    vector_weight=vector_weight,
+                    text_weight=text_weight
+                )
             elif self._supabase:
                 note_results = await self._search_notes(query, limit)
             else:
@@ -526,7 +533,9 @@ class MemoryManager:
     async def _search_notes_hybrid(
         self,
         query: str,
-        limit: int
+        limit: int,
+        vector_weight: Optional[float] = None,
+        text_weight: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """Search notes using hybrid vector + keyword search (from Clawdbot)."""
         results = []
@@ -539,7 +548,9 @@ class MemoryManager:
                 query=query,
                 user_id=None,  # Search all for now
                 limit=limit,
-                min_score=0.3
+                min_score=0.3,
+                vector_weight=vector_weight,
+                text_weight=text_weight
             )
 
             for note in notes:

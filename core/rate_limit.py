@@ -16,6 +16,7 @@ import asyncio
 
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
+import json
 
 logger = logging.getLogger("brainmap.rate_limit")
 
@@ -247,9 +248,23 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         # Extract session ID from request if available
         session_id = None
-        if request.method == "POST" and "session_id" in str(request.url):
-            # Try to get from path or query
+        if request.method == "POST":
+            # Try query param first
             session_id = request.query_params.get("session_id")
+            if not session_id:
+                # Peek JSON body (for /v1/chat/send) and restore it for downstream
+                try:
+                    body = await request.body()
+                    if body:
+                        try:
+                            payload = json.loads(body.decode("utf-8"))
+                            session_id = payload.get("session_id")
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            session_id = None
+                    # Restore body for downstream handlers
+                    request._body = body  # type: ignore[attr-defined]
+                except Exception:
+                    session_id = None
 
         # Check rate limit
         allowed, wait_time, limit_type = self._limiter.check(user_id, session_id)

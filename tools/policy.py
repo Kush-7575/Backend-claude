@@ -41,14 +41,29 @@ class ToolPolicy:
         "get_reminders",
         "complete_reminder",
         "get_current_time",
+        "memory_search",
+        "memory_get",
+        "memory_list",
+        "sessions_spawn",
+        "web_search",
+        "web_research",
+        "web_fetch",
+        "http_request",
+        "skill_read",
     ])
     
     # Integration tools - require API keys
     INTEGRATION_TOOLS: Dict[str, List[str]] = field(default_factory=lambda: {
         "notion": [
             "notion_search",
+            "notion_get_page",
             "notion_create_page",
             "notion_append",
+            "notion_create_database",
+            "notion_add_row",
+            "notion_delete_block",
+            "notion_query_database",
+            "notion_update_row",
         ],
         "calendar": [
             "calendar_list_events",

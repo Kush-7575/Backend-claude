@@ -40,6 +40,9 @@ from tools.notion import (
     is_notion_available
 )
 
+# Import subagent tool
+from tools.subagents import sessions_spawn
+
 __all__ = [
     "ToolRegistry",
     "ToolDefinition",
@@ -75,4 +78,6 @@ __all__ = [
     "notion_query_database",
     "notion_update_row",
     "is_notion_available",
+    # Subagent tools
+    "sessions_spawn",
 ]

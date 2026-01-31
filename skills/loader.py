@@ -11,11 +11,13 @@ Skills are self-contained capabilities that can be
 added or removed without changing core code.
 """
 import os
+import sys
 import logging
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 import yaml
 import re
+import shutil
 
 from core.config import settings
 
@@ -50,6 +52,31 @@ class Skill:
             "enabled": self.enabled
         }
 
+    def prompt_description(self) -> str:
+        """Get a compact description for prompt listings."""
+        if self.description:
+            return self.description.strip()
+        # Fallback: use first non-empty line from instructions.
+        for line in self.instructions.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                return stripped[:120]
+        return "No description"
+
+    def requirements(self) -> Dict[str, Any]:
+        """Extract eligibility requirements from metadata."""
+        requires = self.metadata.get("requires", {}) if isinstance(self.metadata, dict) else {}
+        return requires if isinstance(requires, dict) else {}
+
+    def triggers(self) -> List[str]:
+        """Extract trigger phrases from metadata."""
+        if not isinstance(self.metadata, dict):
+            return []
+        triggers = self.metadata.get("triggers", [])
+        if isinstance(triggers, list):
+            return [str(t) for t in triggers if str(t).strip()]
+        return []
+
 
 class SkillLoader:
     """
@@ -81,6 +108,8 @@ class SkillLoader:
         self._skills_dir = Path(skills_dir) if skills_dir else Path("./skills")
         self._skills: Dict[str, Skill] = {}
         self._user_skills: Dict[str, List[str]] = {}  # user_id -> skill names
+        self._snapshot_version = 0
+        self._skill_mtimes: Dict[str, float] = {}
     
     async def load_all(self) -> int:
         """
@@ -107,6 +136,9 @@ class SkillLoader:
                             logger.debug(f"Loaded skill: {skill.name}")
                     except Exception as e:
                         logger.error(f"Failed to load skill {skill_path.name}: {e}")
+
+        self._snapshot_version = int(max(self._snapshot_version + 1, int(self._get_latest_mtime())))
+        self._skill_mtimes = self._collect_skill_mtimes()
         
         logger.info(f"Loaded {count} skills from {self._skills_dir}")
         return count
@@ -138,7 +170,7 @@ class SkillLoader:
         instructions = frontmatter_match.group(2).strip()
         
         try:
-            metadata = yaml.safe_load(yaml_content)
+            metadata = yaml.safe_load(yaml_content) or {}
         except yaml.YAMLError as e:
             logger.error(f"Invalid YAML in {path}: {e}")
             metadata = {}
@@ -158,6 +190,128 @@ class SkillLoader:
     def list_skills(self) -> List[Dict[str, Any]]:
         """List all available skills."""
         return [skill.to_dict() for skill in self._skills.values()]
+
+    def list_available_skills(self, tool_registry=None, query: Optional[str] = None) -> List[Dict[str, str]]:
+        """List skill entries for prompt injection."""
+        self._maybe_reload()
+        items = []
+        for skill in self._skills.values():
+            if not skill.enabled:
+                continue
+            if not self._is_skill_eligible(skill, tool_registry):
+                continue
+            items.append({
+                "name": skill.name,
+                "description": skill.prompt_description(),
+                "location": str(skill.path),
+            })
+        if query:
+            ranked = []
+            for entry in items:
+                skill = self._skills.get(entry["name"])
+                score = self._score_skill(skill, query) if skill else 0
+                ranked.append((score, entry))
+            ranked.sort(key=lambda x: (x[0], x[1]["name"]), reverse=True)
+            return [e for _, e in ranked]
+        return items
+
+    def _score_skill(self, skill: Skill, query: str) -> int:
+        """Score skill relevance based on trigger phrase matches."""
+        if not skill:
+            return 0
+        text = (query or "").lower()
+        score = 0
+        for trigger in skill.triggers():
+            t = trigger.lower().strip()
+            if not t:
+                continue
+            if t in text:
+                score += 2
+            else:
+                parts = [p for p in t.split() if p]
+                if parts and all(p in text for p in parts):
+                    score += 1
+        return score
+
+    def get_snapshot_version(self) -> int:
+        """Get current skills snapshot version."""
+        self._maybe_reload()
+        return self._snapshot_version
+
+    def _maybe_reload(self) -> None:
+        """Reload skills if any SKILL.md changed."""
+        current = self._collect_skill_mtimes()
+        if not self._skill_mtimes:
+            return
+        if current != self._skill_mtimes:
+            logger.info("Skills changed on disk; reloading.")
+            # Best-effort reload without async context
+            for k in list(self._skills.keys()):
+                self._skills.pop(k, None)
+            try:
+                import asyncio
+                if asyncio.get_event_loop().is_running():
+                    asyncio.create_task(self.load_all())
+                else:
+                    asyncio.run(self.load_all())
+            except Exception as e:
+                logger.warning(f"Skills reload failed: {e}")
+
+    def _collect_skill_mtimes(self) -> Dict[str, float]:
+        mtimes: Dict[str, float] = {}
+        if not self._skills_dir.exists():
+            return mtimes
+        for skill_path in self._skills_dir.glob("**/SKILL.md"):
+            try:
+                mtimes[str(skill_path)] = skill_path.stat().st_mtime
+            except Exception:
+                continue
+        return mtimes
+
+    def _get_latest_mtime(self) -> float:
+        mtimes = self._collect_skill_mtimes()
+        return max(mtimes.values(), default=0.0)
+
+    def _is_skill_eligible(self, skill: Skill, tool_registry=None) -> bool:
+        requires = skill.requirements()
+        # OS filtering
+        os_list = requires.get("os")
+        if isinstance(os_list, list) and os_list:
+            platform = sys.platform.lower()
+            normalized = []
+            for entry in os_list:
+                val = str(entry).lower()
+                if val == "windows":
+                    val = "win32"
+                elif val == "mac" or val == "darwin":
+                    val = "darwin"
+                normalized.append(val)
+            if platform not in normalized:
+                return False
+
+        # Env vars
+        env_list = requires.get("env")
+        if isinstance(env_list, list) and env_list:
+            for env_name in env_list:
+                if not os.environ.get(str(env_name)):
+                    return False
+
+        # Required tools
+        tools_list = requires.get("tools")
+        if isinstance(tools_list, list) and tools_list and tool_registry:
+            available = set(tool_registry.get_tool_names())
+            for tool in tools_list:
+                if str(tool) not in available:
+                    return False
+
+        # Required binaries
+        bins_list = requires.get("bins")
+        if isinstance(bins_list, list) and bins_list:
+            for bin_name in bins_list:
+                if not shutil.which(str(bin_name)):
+                    return False
+
+        return True
     
     async def get_active_skills(self, user_id: str) -> List[Dict[str, str]]:
         """

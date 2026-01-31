@@ -17,6 +17,7 @@ from functools import wraps
 import inspect
 import json
 
+from tools.policy import get_tool_policy
 logger = logging.getLogger("brainmap.tools")
 
 
@@ -83,7 +84,7 @@ class ToolRegistry:
             required = []
             
             for param_name, param in sig.parameters.items():
-                if param_name in ("self", "cls", "uid", "user_id"):
+                if param_name in ("self", "cls", "uid", "user_id", "session_id", "context"):
                     continue
                 
                 param_type = "string"  # Default
@@ -154,9 +155,28 @@ class ToolRegistry:
         """Add post-execution hook."""
         self._post_hooks.append(hook)
     
-    def get_tool_definitions(self) -> List[Dict[str, Any]]:
-        """Get all tools in Claude API format."""
-        return [tool.to_api_format() for tool in self._tools.values()]
+    def get_tool_definitions(self, allowlist: Optional[set[str]] = None) -> List[Dict[str, Any]]:
+        """Get tools in Claude API format, optionally filtered by allowlist."""
+        if allowlist is None:
+            return [tool.to_api_format() for tool in self._tools.values()]
+        return [
+            tool.to_api_format()
+            for name, tool in self._tools.items()
+            if name in allowlist
+        ]
+
+    def get_tool_names(self) -> List[str]:
+        """Get all registered tool names."""
+        return list(self._tools.keys())
+
+    def get_tool_summaries(self, allowlist: Optional[set[str]] = None) -> Dict[str, str]:
+        """Get tool descriptions keyed by name, optionally filtered by allowlist."""
+        summaries: Dict[str, str] = {}
+        for name, tool in self._tools.items():
+            if allowlist is not None and name not in allowlist:
+                continue
+            summaries[name] = (tool.description or "").strip()
+        return summaries
     
     def get_tool(self, name: str) -> Optional[ToolDefinition]:
         """Get a specific tool by name."""
@@ -189,6 +209,30 @@ class ToolRegistry:
             }
         
         context = context or {}
+        extra_kwargs: Dict[str, Any] = {}
+        # Inject context into tool call only if handler accepts it.
+        try:
+            sig = inspect.signature(tool.handler)
+            if "context" in sig.parameters:
+                extra_kwargs["context"] = context
+            if "user_id" in sig.parameters:
+                user_id = context.get("user_id")
+                if user_id:
+                    extra_kwargs["user_id"] = user_id
+            if "session_id" in sig.parameters:
+                session_id = context.get("session_id")
+                if session_id:
+                    extra_kwargs["session_id"] = session_id
+        except Exception as e:
+            logger.debug(f"Tool context injection skipped: {e}")
+        user_id = context.get("user_id")
+        if isinstance(user_id, str) and user_id:
+            policy = get_tool_policy()
+            if not policy.is_tool_allowed(user_id, name):
+                return {
+                    "status": "error",
+                    "error": f"Tool not allowed: {name}"
+                }
         
         try:
             # Run pre-hooks
@@ -209,9 +253,9 @@ class ToolRegistry:
             logger.info(f"Executing tool: {name}")
             
             if inspect.iscoroutinefunction(tool.handler):
-                result = await tool.handler(**inputs)
+                result = await tool.handler(**inputs, **extra_kwargs)
             else:
-                result = tool.handler(**inputs)
+                result = tool.handler(**inputs, **extra_kwargs)
             
             # Run post-hooks
             for hook in self._post_hooks:

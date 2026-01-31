@@ -20,11 +20,14 @@ Builds system prompts from discrete sections:
 Based on Clawdbot's system-prompt.ts patterns.
 """
 import logging
+import re
 from typing import Optional, List, Dict, Any, Callable
-from datetime import datetime, timezone
 from pathlib import Path
 
 from core.config import settings
+from tools.registry import get_tool_registry
+from tools.policy import get_tool_policy
+from core.context import get_context_manager
 
 logger = logging.getLogger("brainmap.prompt")
 
@@ -68,7 +71,6 @@ class PromptBuilder:
         "tools",
         "skills",
         "memory_recall",
-        "memory",
         "response_style",
         "silent_replies",
         "heartbeat",      # Heartbeat protocol (from Clawdbot)
@@ -79,6 +81,34 @@ class PromptBuilder:
         "identity",
         "tools",
         "response_style"
+    ]
+
+    # Tool preference ordering (signal best tools first)
+    TOOL_PREFERENCE_ORDER = [
+        "memory_search",
+        "smart_save",
+        "search_notes",
+        "get_notes",
+        "append_to_note",
+        "create_reminder",
+        "get_reminders",
+        "complete_reminder",
+        "web_search",
+        "web_research"
+    ]
+
+    # Sections eligible for total-budget truncation (lower priority first)
+    TOTAL_BUDGET_TRUNCATION_ORDER = [
+        "workspace",
+        "skills",
+        "tools",
+        "response_style",
+        "runtime_info",
+        "heartbeat",
+        "silent_replies",
+        "reasoning_format",
+        "tool_call_style",
+        "time"
     ]
 
     def __init__(
@@ -98,6 +128,12 @@ class PromptBuilder:
         self._memory = memory_manager
         self._skills = skill_loader
         self._workspace_dir = workspace_dir or DEFAULT_WORKSPACE_DIR
+        self._last_skills_version: Optional[int] = None
+        self._workspace_file_max_chars = settings.WORKSPACE_FILE_MAX_CHARS
+        self._workspace_total_max_chars = settings.WORKSPACE_TOTAL_MAX_CHARS
+        self._section_token_budgets = settings.PROMPT_SECTION_TOKEN_BUDGETS or {}
+        self._total_token_budget = settings.PROMPT_TOTAL_TOKEN_BUDGET
+        self._context = get_context_manager()
 
     async def build(
         self,
@@ -132,16 +168,95 @@ class PromptBuilder:
         else:  # "full"
             sections = self.FULL_SECTIONS
 
-        parts = []
+        section_data = await self._build_sections(user_id, context, sections)
+        return "\n\n".join([s["content"] for s in section_data if s["content"]])
 
+    async def build_with_report(
+        self,
+        user_id: str,
+        context: Optional[Dict[str, Any]] = None,
+        include_sections: Optional[List[str]] = None,
+        mode: PromptMode = "full"
+    ) -> Dict[str, Any]:
+        """Build prompt and return a report with section token counts."""
+        if mode == "none":
+            return {"prompt": "", "total_tokens": 0, "sections": []}
+
+        context = context or {}
+
+        if include_sections is not None:
+            sections = include_sections
+        elif mode == "minimal":
+            sections = self.MINIMAL_SECTIONS
+        else:
+            sections = self.FULL_SECTIONS
+
+        section_data = await self._build_sections(user_id, context, sections)
+        prompt = "\n\n".join([s["content"] for s in section_data if s["content"]])
+        total_tokens = sum(s["tokens"] for s in section_data if s["content"])
+        return {"prompt": prompt, "total_tokens": total_tokens, "sections": section_data}
+
+    async def _build_sections(
+        self,
+        user_id: str,
+        context: Dict[str, Any],
+        sections: List[str]
+    ) -> List[Dict[str, Any]]:
+        data: List[Dict[str, Any]] = []
         for section in sections:
             builder = getattr(self, f"_build_{section}", None)
-            if builder:
-                content = await builder(user_id, context)
-                if content:
-                    parts.append(content)
+            if not builder:
+                continue
+            content = await builder(user_id, context)
+            if not content:
+                continue
+            tokens = self._context.count_tokens(content)
+            truncated = False
+            budget = self._section_token_budgets.get(section)
+            if isinstance(budget, int) and budget > 0 and tokens > budget:
+                content = self._context.truncate_text_to_tokens(content, budget)
+                truncated = True
+                tokens = self._context.count_tokens(content)
+            data.append({
+                "name": section,
+                "content": content,
+                "tokens": tokens,
+                "chars": len(content),
+                "truncated": truncated
+            })
 
-        return "\n\n".join(parts)
+        if self._total_token_budget and self._total_token_budget > 0:
+            data = self._apply_total_budget(data, self._total_token_budget)
+        return data
+
+    def _apply_total_budget(
+        self,
+        data: List[Dict[str, Any]],
+        total_budget: int
+    ) -> List[Dict[str, Any]]:
+        total_tokens = sum(item["tokens"] for item in data)
+        if total_tokens <= total_budget:
+            return data
+
+        excess = total_tokens - total_budget
+        for section in self.TOTAL_BUDGET_TRUNCATION_ORDER:
+            if excess <= 0:
+                break
+            for item in data:
+                if item["name"] != section or not item["content"]:
+                    continue
+                current = item["tokens"]
+                if current <= 0:
+                    continue
+                new_max = max(current - excess, 0)
+                new_content = self._context.truncate_text_to_tokens(item["content"], new_max)
+                item["content"] = new_content
+                item["tokens"] = self._context.count_tokens(new_content)
+                item["chars"] = len(new_content)
+                item["truncated"] = True
+                excess = max(0, excess - (current - item["tokens"]))
+
+        return data
     
     async def _build_identity(
         self,
@@ -175,12 +290,9 @@ You are NOT a chatbot. You are a proactive partner that:
         to use the correct timezone.
         """
         tz = context.get('timezone', 'UTC')
-        now = datetime.now(timezone.utc)
-
         return f"""# Current Date & Time
 
 Time zone: {tz}
-Today: {now.strftime('%A, %B %d, %Y')}
 
 Use this timezone when interpreting time-related requests like "at 5pm" or "tomorrow"."""
 
@@ -192,18 +304,106 @@ Use this timezone when interpreting time-related requests like "at 5pm" or "tomo
         """Build workspace section - inject bootstrap files (Clawdbot pattern)."""
         if not self._workspace_dir.exists():
             return ""
-        
+
+        report = self.get_workspace_report()
+        if not report:
+            return ""
+
         parts = ["# Project Context"]
+        total_used = 0
+        for entry in report:
+            if entry["injected_chars"] <= 0:
+                continue
+            total_used += entry["injected_chars"]
+            title = f"{entry['name']}{' (truncated)' if entry['truncated'] else ''}"
+            parts.append(f"\n## {title}\n\n{entry['content']}")
+            if total_used >= self._workspace_total_max_chars:
+                parts.append("\n## Project Context (truncated)\n\n...[TRUNCATED]")
+                break
+
+        return "\n".join(parts) if len(parts) > 1 else ""
+
+    def get_workspace_report(self) -> List[Dict[str, Any]]:
+        """Get workspace file injection stats for diagnostics."""
+        if not self._workspace_dir.exists():
+            return []
+        report: List[Dict[str, Any]] = []
+        total_used = 0
+        head_ratio = max(0.0, min(1.0, settings.WORKSPACE_TRIM_HEAD_RATIO))
+        tail_ratio = max(0.0, min(1.0, settings.WORKSPACE_TRIM_TAIL_RATIO))
+        if head_ratio + tail_ratio > 1.0:
+            tail_ratio = max(0.0, 1.0 - head_ratio)
+
         for filename in self.BOOTSTRAP_FILES:
             filepath = self._workspace_dir / filename
-            if filepath.exists():
-                try:
-                    file_content = filepath.read_text(encoding="utf-8")
-                    parts.append(f"\n## {filename}\n\n{file_content}")
-                except Exception as e:
-                    logger.warning(f"Failed to read {filepath}: {e}")
-        
-        return "\n".join(parts) if len(parts) > 1 else ""
+            if not filepath.exists():
+                report.append({
+                    "name": filename,
+                    "path": str(filepath),
+                    "missing": True,
+                    "raw_chars": 0,
+                    "injected_chars": 0,
+                    "truncated": False,
+                    "content": "",
+                })
+                continue
+            try:
+                content = filepath.read_text(encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"Failed to read {filepath}: {e}")
+                report.append({
+                    "name": filename,
+                    "path": str(filepath),
+                    "missing": True,
+                    "raw_chars": 0,
+                    "injected_chars": 0,
+                    "truncated": False,
+                    "content": "",
+                })
+                continue
+
+            raw_chars = len(content)
+            injected = content
+            truncated = False
+            if raw_chars > self._workspace_file_max_chars:
+                head_chars = int(self._workspace_file_max_chars * head_ratio)
+                tail_chars = int(self._workspace_file_max_chars * tail_ratio)
+                if head_chars + tail_chars > self._workspace_file_max_chars:
+                    tail_chars = max(0, self._workspace_file_max_chars - head_chars)
+                head = content[:head_chars] if head_chars > 0 else ""
+                tail = content[-tail_chars:] if tail_chars > 0 else ""
+                marker = "\n...[TRUNCATED - read file for full content]...\n"
+                injected = f"{head}{marker}{tail}".strip()
+                truncated = True
+
+            remaining = max(0, self._workspace_total_max_chars - total_used)
+            if remaining <= 0:
+                injected = ""
+            elif len(injected) > remaining:
+                head_chars = int(remaining * head_ratio)
+                tail_chars = int(remaining * tail_ratio)
+                if head_chars + tail_chars > remaining:
+                    tail_chars = max(0, remaining - head_chars)
+                head = injected[:head_chars] if head_chars > 0 else ""
+                tail = injected[-tail_chars:] if tail_chars > 0 else ""
+                marker = "\n...[TRUNCATED]...\n"
+                injected = f"{head}{marker}{tail}".strip()
+                truncated = True
+
+            injected_chars = len(injected)
+            total_used += injected_chars
+
+            report.append({
+                "name": filename,
+                "path": str(filepath),
+                "missing": False,
+                "raw_chars": raw_chars,
+                "injected_chars": injected_chars,
+                "truncated": truncated,
+                "content": injected,
+            })
+
+        return report
     
     async def _build_critical_rules(
         self,
@@ -215,7 +415,7 @@ Use this timezone when interpreting time-related requests like "at 5pm" or "tomo
 
 ## Pre-Flight Checks
 Before EVERY response, check:
-1. **Is this a query about existing info?** → Use `search_notes` FIRST
+1. **Is this a query about existing info?** → Use `memory_search` FIRST
 2. **Is this a request to save/add?** → Check for existing note FIRST
 3. **Is there a time component?** → Use `get_current_time` for context
 
@@ -245,50 +445,83 @@ When calling tools:
         user_id: str,
         context: Dict[str, Any]
     ) -> str:
-        """Build tools section - Clawdbot-style simple summaries."""
-        return """# Tooling
+        """Build tools section from registered tools filtered by policy."""
+        registry = get_tool_registry()
+        policy = get_tool_policy()
+        allowed = set(policy.resolve(user_id))
+        summaries = registry.get_tool_summaries(allowlist=allowed)
+        tool_names = [name for name in registry.get_tool_names() if name in allowed]
+        tool_lines = []
+        for name in sorted(tool_names):
+            summary = summaries.get(name, "")
+            tool_lines.append(f"- {name}: {summary}" if summary else f"- {name}")
 
-Tool availability (filtered by policy):
-- memory_search: Search all memory (daily logs, MEMORY.md, notes, reminders)
-- memory_get: Read specific memory file content
-- memory_list: List available memory files
-- smart_save: Intelligently save content (deduplicates)
-- save_note: Create a new note
-- search_notes: Search user-saved notes
-- get_notes: List recent notes
-- update_note: Modify existing note
-- append_to_note: Add to existing note
-- delete_note: Remove a note
-- create_reminder: Create reminder with natural language time
-- get_reminders: List tasks/reminders
-- complete_reminder: Mark reminder done
-- get_current_time: Get current date/time
-- web_search: Search the web for current information
-- web_fetch: Read content from a URL
+        preferred = [t for t in self.TOOL_PREFERENCE_ORDER if t in allowed]
+        preference_line = ""
+        if preferred:
+            preference_line = "Tool priority: " + " > ".join(preferred)
 
-TOOLS.md does not control tool availability; it is user guidance for how to use tools.
-Tool names are case-sensitive."""
+        return "\n".join([
+            "# Tooling",
+            "",
+            "Tool availability (filtered by policy):",
+            "Tool names are case-sensitive. Call tools exactly as listed.",
+            preference_line,
+            *tool_lines,
+            "",
+            "TOOLS.md does not control tool availability; it is user guidance for how to use tools."
+        ])
     
     async def _build_skills(
         self,
         user_id: str,
         context: Dict[str, Any]
     ) -> str:
-        """Build skills section - active skill instructions."""
+        """Build skills section - compact list with lazy skill loading."""
         if not self._skills:
             return ""
-        
+
+        def xml_escape(value: str) -> str:
+            return (
+                value.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
+                .replace("'", "&apos;")
+            )
+
         try:
-            skills = await self._skills.get_active_skills(user_id)
-            if not skills:
+            tool_registry = get_tool_registry()
+            query = context.get("last_message") if isinstance(context, dict) else None
+            entries = self._skills.list_available_skills(
+                tool_registry=tool_registry,
+                query=query
+            )
+            if not entries:
                 return ""
-            
-            parts = ["# Active Skills"]
-            for skill in skills:
-                parts.append(f"\n## {skill['name']}\n{skill['instructions']}")
-            
-            return "\n".join(parts)
-            
+
+            skills_xml = ["<available_skills>"]
+            for entry in entries:
+                skills_xml.append("  <skill>")
+                skills_xml.append(f"    <name>{xml_escape(entry['name'])}</name>")
+                skills_xml.append(
+                    f"    <description>{xml_escape(entry['description'])}</description>"
+                )
+                skills_xml.append(f"    <location>{xml_escape(entry['location'])}</location>")
+                skills_xml.append("  </skill>")
+            skills_xml.append("</available_skills>")
+
+            return "\n".join([
+                "## Skills (mandatory)",
+                "Before replying: scan <available_skills> <description> entries.",
+                "- If exactly one skill clearly applies: read its SKILL.md at <location> using `skill_read`, then follow it.",
+                "- If multiple could apply: choose the most specific one, then read/follow it.",
+                "- If none clearly apply: do not read any SKILL.md.",
+                "Constraints: never read more than one skill up front; only read after selecting.",
+                "",
+                *skills_xml,
+                "",
+            ])
         except Exception as e:
             logger.warning(f"Failed to load skills: {e}")
             return ""
@@ -300,6 +533,9 @@ Tool names are case-sensitive."""
     ) -> str:
         """Build memory section - relevant context from memory."""
         if not self._memory:
+            return ""
+
+        if not self._should_include_memory_context(context):
             return ""
 
         # Get query from context - use last_message for semantic search
@@ -332,6 +568,61 @@ Tool names are case-sensitive."""
         except Exception as e:
             logger.warning(f"Failed to get memory context: {e}")
             return ""
+
+    def _should_include_memory_context(self, context: Dict[str, Any]) -> bool:
+        """Gate memory retrieval to reduce latency on short/low-signal messages."""
+        if not settings.MEMORY_PREFETCH_ENABLED:
+            return False
+
+        if context.get("skip_memory") is True:
+            return False
+
+        query = (context.get("last_message") or "").strip().lower()
+        if not query:
+            return False
+
+        min_chars = max(1, int(settings.MEMORY_PREFETCH_MIN_CHARS))
+        max_chars = max(min_chars, int(settings.MEMORY_PREFETCH_MAX_CHARS))
+        if len(query) < min_chars:
+            return False
+        if len(query) > max_chars:
+            return True
+
+        if query in {"hi", "hey", "hello", "yo", "sup", "wassup", "what's up"}:
+            return False
+
+        if "memory_search" in query or "search notes" in query:
+            return False
+
+        patterns = [
+            r"\bremember\b",
+            r"\bremind me\b",
+            r"\blast time\b",
+            r"\bearlier\b",
+            r"\bprevious\b",
+            r"\bwhat did we\b",
+            r"\bwhat were we\b",
+            r"\bwhat have we\b",
+            r"\bwe discussed\b",
+            r"\byou said\b",
+            r"\bmy (?:favorite|preference|preferences)\b",
+            r"\bdo i have\b",
+            r"\bmy notes?\b",
+            r"\bnotes? about\b",
+            r"\btasks?\b",
+            r"\btodos?\b",
+            r"\breminders?\b",
+            r"\bmeeting\b",
+            r"\bappointment\b",
+            r"\bschedule\b",
+            r"\bcalendar\b",
+        ]
+        for pattern in patterns:
+            if re.search(pattern, query):
+                return True
+        return "?" in query and any(
+            kw in query for kw in ("past", "previous", "earlier", "last", "before")
+        )
     
     async def _build_response_style(
         self,
@@ -427,7 +718,7 @@ Example:
         """
         return """# Memory Recall
 
-Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search on memory_store/daily/*.md + memory_store/MEMORY.md; then review results. If low confidence after search, say you checked."""
+Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search (it searches daily logs, long-term memory, sessions, notes, reminders); then review results. If low confidence after search, say you checked."""
     
     async def _build_silent_replies(
         self,

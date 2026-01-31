@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 
 from core.dedupe import is_duplicate_inbound
 from core.lanes import session_lane
+from core.event_bus import get_event_bus
+from core.config import settings
 
 logger = logging.getLogger("brainmap.routers.chat")
 
@@ -114,16 +116,35 @@ async def send_message(request: SendMessageRequest):
             session = sessions.create_session(user_id)
     else:
         session = sessions.create_session(user_id)
+
+    # Inbound dedupe (prevents double-processing retries)
+    if is_duplicate_inbound(
+        user_id=user_id,
+        message=request.message,
+        session_id=session.id,
+        channel="api",
+    ):
+        async def duplicate_response():
+            yield "data: ⚠️ Duplicate message ignored\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            duplicate_response(),
+            media_type="text/event-stream"
+        )
     
     # Stream response
     async def generate():
         import json
         import traceback
+        import asyncio
 
         # Issue 2 Fix: Send session_id at start of stream so Fable can track it
         yield f"session: {session.id}\n\n"
 
         logger.info(f"Starting agent stream for message: {request.message[:50]}...")
+        event_bus = get_event_bus()
+        event_queue = event_bus.subscribe(session.id)
 
         try:
             chunk_count = 0
@@ -136,6 +157,11 @@ async def send_message(request: SendMessageRequest):
                 elif chunk.type == "tool_end":
                     if chunk.metadata:
                         yield f"action: {json.dumps(chunk.metadata)}\n\n"
+                elif chunk.type == "lifecycle":
+                    payload = {"phase": chunk.content}
+                    if chunk.metadata:
+                        payload.update(chunk.metadata)
+                    yield f"event: lifecycle\ndata: {json.dumps(payload)}\n\n"
                 elif chunk.type == "error":
                     yield f"data: ⚠️ {chunk.content}\n\n"
                 elif chunk.type == "done":
@@ -146,11 +172,31 @@ async def send_message(request: SendMessageRequest):
             # Save session after response
             await sessions.save_session(session)
 
+            # Keep SSE open briefly for background subagent announcements
+            if settings.SUBAGENT_ANNOUNCE_PUSH_ENABLED:
+                window = max(0, int(settings.SUBAGENT_ANNOUNCE_PUSH_WINDOW_SECONDS))
+                keepalive = max(1, int(settings.SUBAGENT_ANNOUNCE_PUSH_KEEPALIVE_SECONDS))
+                deadline = asyncio.get_event_loop().time() + window
+                while asyncio.get_event_loop().time() < deadline:
+                    timeout = min(keepalive, max(0, deadline - asyncio.get_event_loop().time()))
+                    try:
+                        event = await asyncio.wait_for(event_queue.get(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        # SSE comment keepalive
+                        yield ": keepalive\n\n"
+                        continue
+                    if isinstance(event, dict) and event.get("type") == "subagent_announce":
+                        text = event.get("text", "").strip()
+                        if text:
+                            yield f"data: {text}\n\n"
+
         except Exception as e:
             logger.error(f"Chat error: {e}")
             logger.error(traceback.format_exc())
             yield f"data: Sorry, an error occurred. Please try again.\n\n"
             yield "data: [DONE]\n\n"
+        finally:
+            event_bus.unsubscribe(session.id, event_queue)
     
     return StreamingResponse(
         generate(),
@@ -162,8 +208,18 @@ async def send_message(request: SendMessageRequest):
 async def list_sessions(limit: int = 20):
     """Get recent chat sessions."""
     sessions = get_session_manager()
-    # TODO: Implement list from Supabase
-    return {"sessions": [], "limit": limit}
+    user_id = "current_user"
+    items = await sessions.list_sessions(user_id=user_id, limit=limit)
+    return {"sessions": items, "limit": limit}
+
+
+@router.get("/sessions/summary")
+async def list_sessions_summary(limit: int = 20):
+    """Get lightweight session summaries."""
+    sessions = get_session_manager()
+    user_id = "current_user"
+    items = await sessions.list_sessions_summary(user_id=user_id, limit=limit)
+    return {"sessions": items, "limit": limit}
 
 
 @router.get("/sessions/{session_id}")
@@ -185,11 +241,75 @@ async def get_session(session_id: str):
     }
 
 
+@router.get("/stream")
+async def stream_updates(session_id: str):
+    """
+    Always-on SSE stream for background updates (subagent announcements).
+    """
+    sessions = get_session_manager()
+    user_id = "current_user"
+    session = await sessions.load_session(session_id, user_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    async def generate():
+        import json
+        import asyncio
+
+        yield f"session: {session.id}\n\n"
+        event_bus = get_event_bus()
+        event_queue = event_bus.subscribe(session.id)
+        keepalive = max(1, int(settings.SUBAGENT_ANNOUNCE_PUSH_KEEPALIVE_SECONDS))
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(event_queue.get(), timeout=keepalive)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if isinstance(event, dict) and event.get("type") == "subagent_announce":
+                    payload = {
+                        "type": "subagent_announce",
+                        "text": event.get("text", ""),
+                        "run_id": event.get("run_id"),
+                    }
+                    yield f"event: subagent\ndata: {json.dumps(payload)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            event_bus.unsubscribe(session.id, event_queue)
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.get("/sessions/{session_id}/status")
+async def get_session_status(session_id: str):
+    """Get session status summary (tokens, compactions, counts)."""
+    sessions = get_session_manager()
+    user_id = "current_user"
+    session = await sessions.load_session(session_id, user_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return await sessions.get_session_status(session)
+
+
+@router.get("/sessions/search")
+async def search_sessions(q: str, limit: int = 5):
+    """Search past sessions for relevant content."""
+    sessions = get_session_manager()
+    user_id = "current_user"
+    results = await sessions.search_session_history(q, user_id=user_id, limit=limit)
+    return {"query": q, "results": results, "limit": limit}
+
+
 @router.delete("/sessions/{session_id}", status_code=204)
 async def delete_session(session_id: str):
     """Delete a chat session."""
-    # TODO: Implement delete in Supabase
-    pass
+    sessions = get_session_manager()
+    user_id = "current_user"
+    ok = await sessions.delete_session(session_id, user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Session not found")
 
 
 @router.get("/greeting")

@@ -8,17 +8,23 @@ These tools search/read memory from Supabase tables (persistent on Railway).
 Falls back to local files only if database unavailable.
 """
 import logging
+import time
+from collections import OrderedDict
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from datetime import datetime, timezone
 
 from tools.registry import get_tool_registry
+from core.config import settings
 
 logger = logging.getLogger("brainmap.tools.memory")
 
 # Module-level dependencies (injected at startup)
 _memory_manager = None
 _memory_dir: Optional[Path] = None
+
+# memory_search cache (query -> result)
+_memory_search_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
 
 def set_memory_dependencies(memory_manager=None, memory_dir: Optional[Path] = None):
@@ -59,6 +65,9 @@ async def memory_search(
     max_results: int = 10,
     min_score: float = 0.2,
     sources: Optional[List[str]] = None,
+    use_hybrid: bool = True,
+    vector_weight: Optional[float] = None,
+    text_weight: Optional[float] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -77,25 +86,49 @@ async def memory_search(
     all_results = []
 
     try:
+        cache_key = _build_memory_cache_key(
+            query=query,
+            max_results=max_results,
+            min_score=min_score,
+            sources=sources,
+            use_hybrid=use_hybrid,
+            vector_weight=vector_weight,
+            text_weight=text_weight
+        )
+        cached = _memory_cache_get(cache_key)
+        if cached:
+            return cached
+
         # 1. Search memory sources (memory files, daily logs, sessions)
         memory_sources = [s for s in sources if s in ["memory", "daily", "sessions"]]
         if memory_sources:
             memory_results = await _memory_manager.search(
                 query=query,
                 limit=max_results,
-                sources=memory_sources
+                sources=memory_sources,
+                use_hybrid=use_hybrid,
+                vector_weight=vector_weight,
+                text_weight=text_weight
             )
             all_results.extend(memory_results)
 
         # 2. Search notes if included
         if "notes" in sources:
-            note_results = await _search_notes_for_memory(query, max_results)
+            note_results = await _search_notes_for_memory(
+                query,
+                max_results,
+                vector_weight=vector_weight,
+                text_weight=text_weight
+            )
             all_results.extend(note_results)
 
         # 3. Search reminders if included
         if "reminders" in sources:
             reminder_results = await _search_reminders_for_memory(query, max_results)
             all_results.extend(reminder_results)
+
+        # Apply role-aware source weighting
+        all_results = _apply_source_weights(all_results, query)
 
         # Filter by min_score and sort by relevance
         all_results = [r for r in all_results if r.get("relevance", 0) >= min_score]
@@ -121,13 +154,15 @@ async def memory_search(
                 "date": r.get("date", r.get("timestamp", ""))
             })
 
-        return {
+        response = {
             "success": True,
             "results": formatted,
             "count": len(formatted),
             "query": query,
             "sources_searched": sources
         }
+        _memory_cache_put(cache_key, response)
+        return response
 
     except Exception as e:
         logger.error(f"memory_search error: {e}")
@@ -137,11 +172,104 @@ async def memory_search(
         }
 
 
+def _apply_source_weights(results: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+    """Apply source-specific weights based on query intent."""
+    if not results:
+        return results
+    text = (query or "").lower()
+
+    prefers_preferences = any(
+        kw in text for kw in ["favorite", "preference", "prefer", "like", "dislike", "my "]
+    )
+    prefers_history = any(
+        kw in text for kw in ["last time", "earlier", "previous", "we discussed", "you said", "what did we"]
+    )
+
+    base_weights = {
+        "long_term_memory": 1.2,
+        "daily_log": 1.0,
+        "sessions": 1.0,
+        "notes": 0.95,
+        "notes_hybrid": 0.95,
+        "note": 0.95,
+        "reminders": 1.0,
+    }
+
+    if prefers_preferences:
+        base_weights["long_term_memory"] = 1.4
+    if prefers_history:
+        base_weights["daily_log"] = 1.2
+        base_weights["sessions"] = 1.2
+
+    for r in results:
+        source = r.get("source", "unknown")
+        weight = base_weights.get(source, 1.0)
+        base_score = r.get("relevance", r.get("score", 0)) or 0
+        r["relevance"] = base_score * weight
+
+    return results
+
+
+def _build_memory_cache_key(
+    query: str,
+    max_results: int,
+    min_score: float,
+    sources: List[str],
+    use_hybrid: bool,
+    vector_weight: Optional[float],
+    text_weight: Optional[float]
+) -> str:
+    sources_key = ",".join(sorted(sources))
+    return "|".join([
+        query.strip().lower(),
+        f"max={max_results}",
+        f"min={min_score}",
+        f"sources={sources_key}",
+        f"hybrid={use_hybrid}",
+        f"vw={vector_weight if vector_weight is not None else 'default'}",
+        f"tw={text_weight if text_weight is not None else 'default'}",
+    ])
+
+
+def _memory_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    if not settings.MEMORY_SEARCH_CACHE_ENABLED:
+        return None
+    entry = _memory_search_cache.get(key)
+    if not entry:
+        return None
+    expires_at = entry.get("_expires_at", 0)
+    if expires_at and time.time() > expires_at:
+        _memory_search_cache.pop(key, None)
+        return None
+    # Refresh LRU order
+    _memory_search_cache.move_to_end(key)
+    return entry.get("value")
+
+
+def _memory_cache_put(key: str, value: Dict[str, Any]) -> None:
+    if not settings.MEMORY_SEARCH_CACHE_ENABLED:
+        return
+    ttl = max(1, int(settings.MEMORY_SEARCH_CACHE_TTL_SECONDS))
+    _memory_search_cache[key] = {
+        "value": value,
+        "_expires_at": time.time() + ttl
+    }
+    _memory_search_cache.move_to_end(key)
+    max_entries = max(1, int(settings.MEMORY_SEARCH_CACHE_MAX_ENTRIES))
+    while len(_memory_search_cache) > max_entries:
+        _memory_search_cache.popitem(last=False)
+
+
 # =============================================================================
 # Helper Functions for Unified Search
 # =============================================================================
 
-async def _search_notes_for_memory(query: str, limit: int) -> List[Dict[str, Any]]:
+async def _search_notes_for_memory(
+    query: str,
+    limit: int,
+    vector_weight: Optional[float] = None,
+    text_weight: Optional[float] = None
+) -> List[Dict[str, Any]]:
     """Search notes and format for unified memory results."""
     results = []
 
@@ -153,7 +281,9 @@ async def _search_notes_for_memory(query: str, limit: int) -> List[Dict[str, Any
             query=query,
             user_id=None,  # Search all
             limit=limit,
-            min_score=0.2
+            min_score=0.2,
+            vector_weight=vector_weight,
+            text_weight=text_weight
         )
 
         for note in notes:
