@@ -85,15 +85,7 @@ def is_perplexity_available() -> bool:
 
 @tool(
     name="web_search",
-    description="""Fast web search using Tavily (~0.5s response time).
-
-    USE THIS when:
-    - User asks about current events, news, recent data
-    - User wants factual info: prices, scores, lists, rankings
-    - Quick lookups: "what is X", "who is Y", "when did Z happen"
-    - Any query where you need fresh data fast
-
-    For complex research questions requiring synthesis, use web_research instead."""
+    description="Search the web for current information."
 )
 async def web_search(
     query: str,
@@ -184,15 +176,7 @@ async def web_search(
 
 @tool(
     name="web_research",
-    description="""Deep web research using Perplexity Sonar (~5s response time).
-
-    USE THIS when:
-    - Complex questions requiring synthesis from multiple sources
-    - "Compare X vs Y", "What are the pros and cons of..."
-    - Questions needing analysis, not just facts
-    - Following up on web_search for deeper understanding
-
-    For quick factual lookups, use web_search instead (10x faster)."""
+    description="Deep web research with synthesis (Perplexity Sonar)."
 )
 async def web_research(
     query: str,

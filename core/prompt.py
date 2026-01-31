@@ -245,41 +245,28 @@ When calling tools:
         user_id: str,
         context: Dict[str, Any]
     ) -> str:
-        """Build tools section - Clawdbot-style summaries with inline scenarios."""
+        """Build tools section - Clawdbot-style simple summaries."""
         return """# Tooling
 
-## 🔍 Unified Search (PRIMARY)
-- memory_search: **SEARCH EVERYTHING** - conversations, notes, reminders, all user data
-  - Use for ANY question about past info: "what did we discuss", "what's my preference", "what tasks do I have"
-  - Searches: daily logs, MEMORY.md, sessions, notes, AND reminders
-  - This is your go-to tool for finding information
-
-## Memory File Tools
-- memory_get: Read specific memory file content (use after memory_search finds something)
+Tool availability (filtered by policy):
+- memory_search: Search all memory (daily logs, MEMORY.md, notes, reminders)
+- memory_get: Read specific memory file content
 - memory_list: List available memory files
-
-## Note Tools (For Creating/Managing)
-- smart_save: Intelligently save content (searches first, deduplicates)
-- save_note: Create a new note directly
-- search_notes: Search only user-saved notes (use memory_search instead for unified search)
-- get_notes: List all recent notes
+- smart_save: Intelligently save content (deduplicates)
+- save_note: Create a new note
+- search_notes: Search user-saved notes
+- get_notes: List recent notes
 - update_note: Modify existing note
 - append_to_note: Add to existing note
-- delete_note: Remove a note (ask confirmation first)
-
-## Reminder Tools (For Creating/Managing)
+- delete_note: Remove a note
 - create_reminder: Create reminder with natural language time
-- get_reminders: List all tasks/reminders
-- complete_reminder: Mark reminder as done
-
-## Utility Tools
+- get_reminders: List tasks/reminders
+- complete_reminder: Mark reminder done
 - get_current_time: Get current date/time
-- web_search: Search the web for real-time info
+- web_search: Search the web for current information
 - web_fetch: Read content from a URL
 
-**Key Pattern:** For ANY question about past info, use `memory_search` first. It searches everything.
-
-TOOLS.md contains detailed usage notes and scenarios.
+TOOLS.md does not control tool availability; it is user guidance for how to use tools.
 Tool names are case-sensitive."""
     
     async def _build_skills(
@@ -388,28 +375,14 @@ After tool use:
     ) -> str:
         """
         Build tool call style section - Clawdbot anti-verbosity pattern.
-        
-        This is CRITICAL for reducing agent chatter. The agent should
-        just call tools without narrating every step.
+        Matches system-prompt.ts lines 360-364.
         """
         return """# Tool Call Style
 
-Default: do NOT narrate routine, low-risk tool calls (just call the tool).
-
-Narrate only when it helps:
-- Multi-step work where progress updates are useful
-- Complex or challenging problems that benefit from thinking aloud
-- Sensitive actions (e.g., deletions) that warrant confirmation
-- When the user explicitly asks for explanation
-
-Keep narration brief and value-dense. Avoid repeating obvious steps.
-Use plain human language for narration.
-
-❌ Wrong: "I'll search your notes for that topic now using the search_notes tool..."
-✅ Right: [just call search_notes]
-
-❌ Wrong: "Let me save that for you. I'm going to use smart_save to..."
-✅ Right: [just call smart_save, then confirm: "✅ Saved: Topic Name"]"""
+Default: do not narrate routine, low-risk tool calls (just call the tool).
+Narrate only when it helps: multi-step work, complex/challenging problems, sensitive actions (e.g., deletions), or when the user explicitly asks.
+Keep narration brief and value-dense; avoid repeating obvious steps.
+Use plain human language for narration unless in a technical context."""
     
     async def _build_reasoning_format(
         self,
@@ -448,45 +421,13 @@ Example:
         """
         Build memory recall section - Clawdbot proactive search pattern.
 
-        This makes the agent search memory BEFORE answering instead of
-        only when explicitly asked.
-
-        memory_search now searches EVERYTHING (unified search).
+        Matches Clawdbot's system-prompt.ts lines 35-44 exactly:
+        "Before answering anything about prior work, decisions, dates, people,
+        preferences, or todos: run memory_search on MEMORY.md + memory/*.md"
         """
-        return """# Memory Recall (Proactive)
+        return """# Memory Recall
 
-**`memory_search` is your unified search** - it searches EVERYTHING:
-- All conversations (daily logs)
-- Long-term facts (MEMORY.md)
-- Past sessions
-- User-saved notes
-- Reminders/tasks
-
-Before answering ANY question about past information:
-1. Call `memory_search` with relevant keywords
-2. Review results from all sources
-3. Answer based on what you found
-
-**When to search:**
-- Prior work, decisions, or discussions
-- Dates, times, appointments, schedules
-- People, contacts, relationships
-- User preferences, habits, favorites
-- Tasks, reminders, to-dos
-- Saved notes, recipes, lists
-
-If search returns no results:
-- Say "I checked but didn't find anything about [topic]"
-- Don't pretend you know or make things up
-
-❌ Wrong: User asks "When is my dentist appointment?" → You guess a date
-✅ Right: User asks "When is my dentist appointment?" → memory_search("dentist appointment") → Answer based on results
-
-❌ Wrong: User asks "What did we discuss about the project?" → You make something up
-✅ Right: User asks "What did we discuss about the project?" → memory_search("project discussion") → "I checked but didn't find that in your memory"
-
-❌ Wrong: User asks "What notes did I save about recipes?" → You use memory_search
-✅ Right: User asks "What notes did I save about recipes?" → search_notes("recipes") → These are user-saved notes"""
+Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search on memory_store/daily/*.md + memory_store/MEMORY.md; then review results. If low confidence after search, say you checked."""
     
     async def _build_silent_replies(
         self,
