@@ -462,8 +462,9 @@ class SessionManager:
             return
         
         # Generate summary of old messages
+        # Use multi-part compaction for very large contexts (Clawdbot pattern)
         if to_summarize:
-            summary = await self._generate_summary(to_summarize)
+            summary = await self._generate_summary_multipart(to_summarize)
             
             # Create compacted messages list
             compacted_messages = [
@@ -504,6 +505,99 @@ class SessionManager:
                 f"{len(to_keep)} kept. Total compactions: {session.compaction_count}"
             )
     
+    async def _generate_summary_multipart(
+        self,
+        messages: List[Dict[str, Any]],
+        previous_summary: Optional[str] = None
+    ) -> str:
+        """
+        Generate summary with multi-part support for large contexts.
+        
+        From Clawdbot's adaptive compaction - splits large message sets
+        into chunks, summarizes each, then merges summaries.
+        
+        Args:
+            messages: Messages to summarize
+            previous_summary: Existing summary to update
+            
+        Returns:
+            Merged summary string
+        """
+        # Check if we need multi-part summarization
+        total_tokens = self._context.count_messages_tokens(messages)
+        
+        # If small enough, use single-pass
+        if total_tokens < 40000:  # Well under Haiku's limit
+            return await self._generate_summary(messages, previous_summary)
+        
+        # Split into chunks that fit within model limits
+        chunks = self._context.chunk_messages_by_max_tokens(messages, max_tokens=30000)
+        
+        if len(chunks) == 1:
+            return await self._generate_summary(messages, previous_summary)
+        
+        logger.info(f"Using multi-part compaction: {len(chunks)} chunks")
+        
+        # Summarize each chunk
+        partial_summaries = []
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Summarizing chunk {i+1}/{len(chunks)}")
+            chunk_summary = await self._generate_summary(chunk, None)
+            partial_summaries.append(chunk_summary)
+        
+        # Merge summaries into final summary
+        merged = await self._merge_summaries(partial_summaries, previous_summary)
+        return merged
+    
+    async def _merge_summaries(
+        self,
+        summaries: List[str],
+        previous_summary: Optional[str] = None
+    ) -> str:
+        """
+        Merge multiple partial summaries into one cohesive summary.
+        
+        From Clawdbot's MERGE_SUMMARIES_INSTRUCTIONS pattern.
+        """
+        if len(summaries) == 1:
+            return summaries[0]
+        
+        merge_prompt = """Merge these partial conversation summaries into a single cohesive summary.
+Preserve all important information including:
+- Decisions made and their rationale
+- TODOs and action items
+- Open questions and concerns
+- Key constraints or requirements
+- Progress on goals
+
+Partial summaries to merge:
+
+"""
+        for i, summary in enumerate(summaries, 1):
+            merge_prompt += f"--- Part {i} ---\n{summary}\n\n"
+        
+        if previous_summary:
+            merge_prompt += f"\n--- Previous Summary (incorporate context) ---\n{previous_summary}\n"
+        
+        try:
+            import anthropic
+            client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+            
+            response = await client.messages.create(
+                model="claude-3-haiku-20240307",
+                max_tokens=2000,
+                system="You are a conversation summarizer. Merge the partial summaries into one comprehensive summary.",
+                messages=[{"role": "user", "content": merge_prompt}]
+            )
+            
+            merged = response.content[0].text
+            logger.info(f"Merged {len(summaries)} summaries into {len(merged)} chars")
+            return merged
+            
+        except Exception as e:
+            logger.warning(f"Summary merge failed, concatenating: {e}")
+            return "\n\n---\n\n".join(summaries)
+
     async def _generate_summary(
         self,
         messages: List[Dict[str, Any]],

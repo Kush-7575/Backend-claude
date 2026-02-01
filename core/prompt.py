@@ -21,6 +21,7 @@ Based on Clawdbot's system-prompt.ts patterns.
 """
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Callable
 from pathlib import Path
 
@@ -28,6 +29,56 @@ from core.config import settings
 from tools.registry import get_tool_registry
 from tools.policy import get_tool_policy
 from core.context import get_context_manager
+
+
+# Cache TTL constants (from Clawdbot cache-ttl.ts)
+CACHE_TTL_INTERVAL_SECONDS = 300  # 5 minutes - prompts with same timestamp hit cache
+CACHE_TTL_ELIGIBLE_PROVIDERS = {"anthropic", "openai"}  # Providers that support prompt caching
+
+
+def is_cache_ttl_eligible_provider(provider: str) -> bool:
+    """Check if provider supports prompt caching."""
+    return provider.lower() in CACHE_TTL_ELIGIBLE_PROVIDERS
+
+
+def get_cache_ttl_timestamp() -> str:
+    """
+    Get a timestamp for cache TTL bucketing.
+    
+    From Clawdbot's appendCacheTtlTimestamp - rounds to 5-minute intervals
+    so prompts within the same window will hit cache.
+    
+    Returns:
+        Timestamp comment string to append to system prompt
+    """
+    now = datetime.now(timezone.utc)
+    # Round to nearest 5-minute interval
+    bucket = (now.timestamp() // CACHE_TTL_INTERVAL_SECONDS) * CACHE_TTL_INTERVAL_SECONDS
+    bucket_time = datetime.fromtimestamp(bucket, timezone.utc)
+    return f"\n\n<!-- cache-ttl: {bucket_time.isoformat()} -->"
+
+
+def append_cache_ttl_timestamp(
+    system_prompt: str,
+    provider: str = "anthropic"
+) -> str:
+    """
+    Append cache TTL timestamp to system prompt if eligible.
+    
+    From Clawdbot's cache-ttl.ts pattern - adds a timestamp comment
+    that buckets cache keys by time interval.
+    
+    Args:
+        system_prompt: The system prompt to modify
+        provider: The LLM provider being used
+        
+    Returns:
+        System prompt with optional cache TTL timestamp
+    """
+    if not is_cache_ttl_eligible_provider(provider):
+        return system_prompt
+    
+    return system_prompt + get_cache_ttl_timestamp()
 
 logger = logging.getLogger("brainmap.prompt")
 

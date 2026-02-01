@@ -30,13 +30,22 @@ from tenacity import (
 
 from core.config import settings
 from core.session import Session, SessionManager
-from core.context import get_context_manager
+from core.context import get_context_manager, enforce_context_window_guard
 from core.stream_chunker import (
     create_stream_chunker,
     StreamBlockChunker,
     strip_block_tags,
     ChunkerState as StreamChunkerState
 )
+from core.run_registry import (
+    RunHandle,
+    get_run_registry,
+    set_active_run,
+    clear_active_run,
+    is_run_active,
+    queue_run_message,
+)
+from core.prompt import append_cache_ttl_timestamp
 from core.message_transform import (
     transform_messages,
     TransformConfig,
@@ -925,122 +934,159 @@ class AgentRunner:
         the session lock. DO NOT acquire additional session locks here to
         avoid deadlock (asyncio.Lock is not reentrant).
         """
-        # Pre-turn hooks
-        user_message = await self._run_pre_hooks(session, user_message)
-
-        # Add user message (auto_compact=False, we'll handle compaction manually for streaming)
-        # Note: No nested lock needed - we're already inside session_lane
-        await self._session.add_message(session, "user", user_message, auto_compact=False)
-
-        session.metadata.setdefault("lifecycle_events", []).append({
-            "phase": "start",
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-
-        yield StreamChunk(
-            type="lifecycle",
-            content="start",
-            metadata={"phase": "start"}
-        )
-
-        # Clawdbot-style: do not auto-prefetch memory into the prompt
-
-        # Get messages for API
-        raw_messages = session.get_api_messages(prune=settings.CONTEXT_PRUNE_ENABLED)
-
-        # Check if compaction is needed - trigger FULL compaction, not just truncation
-        # This is critical: streaming mode must also flush to memory and summarize
-        # Note: We already hold session lock, only acquire global lane for compaction
-        if self._context.needs_compaction(raw_messages):
-            logger.info("Context needs compaction before stream - triggering full compaction")
-            try:
-                # Only acquire global lane (we already have session lock)
-                async with global_lane("compaction"):
-                    yield StreamChunk(
-                        type="lifecycle",
-                        content="compaction_start",
-                        metadata={"phase": "compaction_start"}
-                    )
-                    # Trigger the proper compaction flow (flush to memory + summarize)
-                    await self._session._compact_session(session)
-                # Refresh messages after compaction
-                raw_messages = session.get_api_messages()
-                logger.info(f"Compaction complete, now have {len(raw_messages)} messages")
-                yield StreamChunk(
-                    type="lifecycle",
-                    content="compaction_end",
-                    metadata={"phase": "compaction_end"}
-                )
-            except Exception as e:
-                logger.error(f"Compaction failed, falling back to truncation: {e}")
-                raw_messages = self._context.truncate_to_fit(raw_messages)
-
-        # Soft-trim oversized message blocks (Clawdbot-like pruning)
-        messages = self._context.soft_trim_messages(raw_messages)
-        messages = self._prune_tool_results_in_messages(messages)
+        import uuid
         
-        # Message transformation for cross-provider compatibility (pi-agent pattern)
-        # Handles: orphaned tool calls, ID normalization, errored message removal
-        messages = transform_messages(messages, TransformConfig())
+        # Generate unique run ID
+        run_id = str(uuid.uuid4())[:8]
         
-        # Validate turn ordering (Clawdbot pattern)
-        messages = validate_anthropic_turns(messages)
-        messages = ensure_valid_turn_start(messages)
-        
-        # Limit history to prevent context bloat
-        messages = limit_history_turns(messages, max_turns=50)
-        
-        # Sanitize tool call IDs for provider compatibility
-        messages = sanitize_tool_call_ids_in_messages(messages)
-        
-        # Apply optional transformContext hook (pi-agent pattern)
-        if self._transform_context:
-            try:
-                messages = await self._transform_context(messages)
-            except Exception as e:
-                logger.warning(f"transformContext hook failed: {e}")
-        
-        # Create cache trace for diagnostics
-        cache_trace = create_cache_trace(
+        # Create run handle for registry (Clawdbot pattern)
+        run_handle = RunHandle(
             session_id=session.id,
-            provider="anthropic",
-            model_id=settings.CLAUDE_MODEL
+            run_id=run_id,
+            _is_streaming=lambda: self._is_streaming,
+            _is_compacting=lambda: self._is_compacting,
+            _abort=lambda: self._abort_controller.set() if self._abort_controller else None,
+            _queue_message=lambda text: self._queue_follow_up(text)
         )
-        cache_trace.record_stage("prompt:before", messages=messages, system=system_prompt)
         
-        # Build system prompt with context for memory retrieval
-        prompt_report = None
-        if system_prompt is None and self._prompt:
-            prompt_mode = self._resolve_prompt_mode(user_message)
-            # Pass the user message for memory context retrieval
-            prompt_context = {
-                "last_message": user_message,
-                "channel": "stream",
-                "skip_memory": True
-            }
-            if hasattr(self._prompt, "build_with_report"):
-                report = await self._prompt.build_with_report(
-                    session.user_id,
-                    context=prompt_context,
-                    mode=prompt_mode
-                )
-                system_prompt = report.get("prompt", "")
-                prompt_report = report
-            else:
-                system_prompt = await self._prompt.build(
-                    session.user_id,
-                    context=prompt_context,
-                    mode=prompt_mode
-                )
-        system_prompt = system_prompt or self._default_system_prompt()
-        
-        # Get tools
-        if tools is None and self._tools:
-            tools = self._resolve_tool_definitions(session)
-        
-        full_response = []
+        # Register active run
+        await set_active_run(session.id, run_handle)
         
         try:
+            # Pre-flight context window guard (Clawdbot pattern)
+            # Check BEFORE starting any work
+            try:
+                enforce_context_window_guard(
+                    provider="anthropic",
+                    model_id=settings.CLAUDE_MODEL,
+                    model_context_window=self._context.MODEL_LIMITS.get(settings.CLAUDE_MODEL)
+                )
+            except Exception as guard_error:
+                logger.error(f"Context window guard failed: {guard_error}")
+                yield StreamChunk(
+                    type="error",
+                    content=str(guard_error),
+                    metadata={"phase": "guard_failed", "reason": "context_window_too_small"}
+                )
+                return
+            
+            # Pre-turn hooks
+            user_message = await self._run_pre_hooks(session, user_message)
+
+            # Add user message (auto_compact=False, we'll handle compaction manually for streaming)
+            # Note: No nested lock needed - we're already inside session_lane
+            await self._session.add_message(session, "user", user_message, auto_compact=False)
+
+            session.metadata.setdefault("lifecycle_events", []).append({
+                "phase": "start",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+            yield StreamChunk(
+                type="lifecycle",
+                content="start",
+                metadata={"phase": "start"}
+            )
+
+            # Clawdbot-style: do not auto-prefetch memory into the prompt
+
+            # Get messages for API
+            raw_messages = session.get_api_messages(prune=settings.CONTEXT_PRUNE_ENABLED)
+
+            # Check if compaction is needed - trigger FULL compaction, not just truncation
+            # This is critical: streaming mode must also flush to memory and summarize
+            # Note: We already hold session lock, only acquire global lane for compaction
+            if self._context.needs_compaction(raw_messages):
+                logger.info("Context needs compaction before stream - triggering full compaction")
+                try:
+                    # Only acquire global lane (we already have session lock)
+                    async with global_lane("compaction"):
+                        yield StreamChunk(
+                            type="lifecycle",
+                            content="compaction_start",
+                            metadata={"phase": "compaction_start"}
+                        )
+                        # Trigger the proper compaction flow (flush to memory + summarize)
+                        await self._session._compact_session(session)
+                    # Refresh messages after compaction
+                    raw_messages = session.get_api_messages()
+                    logger.info(f"Compaction complete, now have {len(raw_messages)} messages")
+                    yield StreamChunk(
+                        type="lifecycle",
+                        content="compaction_end",
+                        metadata={"phase": "compaction_end"}
+                    )
+                except Exception as e:
+                    logger.error(f"Compaction failed, falling back to truncation: {e}")
+                    raw_messages = self._context.truncate_to_fit(raw_messages)
+
+            # Soft-trim oversized message blocks (Clawdbot-like pruning)
+            messages = self._context.soft_trim_messages(raw_messages)
+            messages = self._prune_tool_results_in_messages(messages)
+            
+            # Message transformation for cross-provider compatibility (pi-agent pattern)
+            # Handles: orphaned tool calls, ID normalization, errored message removal
+            messages = transform_messages(messages, TransformConfig())
+            
+            # Validate turn ordering (Clawdbot pattern)
+            messages = validate_anthropic_turns(messages)
+            messages = ensure_valid_turn_start(messages)
+            
+            # Limit history to prevent context bloat
+            messages = limit_history_turns(messages, max_turns=50)
+            
+            # Sanitize tool call IDs for provider compatibility
+            messages = sanitize_tool_call_ids_in_messages(messages)
+            
+            # Apply optional transformContext hook (pi-agent pattern)
+            if self._transform_context:
+                try:
+                    messages = await self._transform_context(messages)
+                except Exception as e:
+                    logger.warning(f"transformContext hook failed: {e}")
+            
+            # Create cache trace for diagnostics
+            cache_trace = create_cache_trace(
+                session_id=session.id,
+                provider="anthropic",
+                model_id=settings.CLAUDE_MODEL
+            )
+            cache_trace.record_stage("prompt:before", messages=messages, system=system_prompt)
+            
+            # Build system prompt with context for memory retrieval
+            prompt_report = None
+            if system_prompt is None and self._prompt:
+                prompt_mode = self._resolve_prompt_mode(user_message)
+                # Pass the user message for memory context retrieval
+                prompt_context = {
+                    "last_message": user_message,
+                    "channel": "stream",
+                    "skip_memory": True
+                }
+                if hasattr(self._prompt, "build_with_report"):
+                    report = await self._prompt.build_with_report(
+                        session.user_id,
+                        context=prompt_context,
+                        mode=prompt_mode
+                    )
+                    system_prompt = report.get("prompt", "")
+                    prompt_report = report
+                else:
+                    system_prompt = await self._prompt.build(
+                        session.user_id,
+                        context=prompt_context,
+                        mode=prompt_mode
+                    )
+            system_prompt = system_prompt or self._default_system_prompt()
+            
+            # Append cache TTL timestamp for prompt caching (Clawdbot pattern)
+            system_prompt = append_cache_ttl_timestamp(system_prompt, provider="anthropic")
+            
+            # Get tools
+            if tools is None and self._tools:
+                tools = self._resolve_tool_definitions(session)
+            
+            full_response = []
             client = await self._get_client()
             
             # Use cached system prompt format
@@ -1266,6 +1312,27 @@ class AgentRunner:
                     # No tools called or Claude finished - we're done!
                     break
                 
+                # Clawdbot pattern: Flush pending text buffer before tool execution
+                # This ensures text arrives in order before tool notifications
+                for chunk in chunker.flush():
+                    await apply_human_delay(is_first_chunk=False)
+                    cleaned_chunk = strip_block_tags(chunk, stream_chunker_state)
+                    if cleaned_chunk and cleaned_chunk.strip():
+                        accumulated_text += cleaned_chunk
+                        if not (settings.STREAM_DEDUPLICATE_CHUNKS and 
+                                normalize_text_for_comparison(cleaned_chunk) == last_streamed_norm):
+                            last_accumulated_sent = accumulated_text
+                            yield StreamChunk(
+                                type="text",
+                                content=cleaned_chunk,
+                                metadata={
+                                    "delta": cleaned_chunk,
+                                    "accumulated": accumulated_text
+                                }
+                            )
+                            if settings.STREAM_DEDUPLICATE_CHUNKS:
+                                last_streamed_norm = normalize_text_for_comparison(cleaned_chunk)
+                
                 # Execute tools and prepare tool results for next iteration
                 tool_results = []
                 for tool in tool_calls:
@@ -1441,6 +1508,9 @@ class AgentRunner:
             # Clean up streaming state
             self._is_streaming = False
             self._abort_controller = None
+            
+            # Clear from run registry (Clawdbot pattern)
+            await clear_active_run(session.id, run_handle)
     
     def _add_cache_control_to_messages(
         self,
