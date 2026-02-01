@@ -45,6 +45,20 @@ from core.errors import (
     is_retryable
 )
 from core.lanes import session_lane, global_lane
+from core.turn_validation import (
+    validate_anthropic_turns,
+    limit_history_turns,
+    ensure_valid_turn_start
+)
+from core.failover import (
+    FailoverError,
+    FailoverReason,
+    with_compaction_retry,
+    CompactionRetryConfig
+)
+from core.cache_trace import create_cache_trace
+from core.tool_call_id import sanitize_tool_call_ids_in_messages
+from core.thought_signatures import sanitize_user_facing_text
 from tools.policy import get_tool_policy
 
 logger = logging.getLogger("brainmap.agent")
@@ -964,12 +978,30 @@ class AgentRunner:
         # Handles: orphaned tool calls, ID normalization, errored message removal
         messages = transform_messages(messages, TransformConfig())
         
+        # Validate turn ordering (Clawdbot pattern)
+        messages = validate_anthropic_turns(messages)
+        messages = ensure_valid_turn_start(messages)
+        
+        # Limit history to prevent context bloat
+        messages = limit_history_turns(messages, max_turns=50)
+        
+        # Sanitize tool call IDs for provider compatibility
+        messages = sanitize_tool_call_ids_in_messages(messages)
+        
         # Apply optional transformContext hook (pi-agent pattern)
         if self._transform_context:
             try:
                 messages = await self._transform_context(messages)
             except Exception as e:
                 logger.warning(f"transformContext hook failed: {e}")
+        
+        # Create cache trace for diagnostics
+        cache_trace = create_cache_trace(
+            session_id=session.id,
+            provider="anthropic",
+            model_id=settings.CLAUDE_MODEL
+        )
+        cache_trace.record_stage("prompt:before", messages=messages, system=system_prompt)
         
         # Build system prompt with context for memory retrieval
         prompt_report = None
@@ -1256,7 +1288,8 @@ class AgentRunner:
                 logger.info(f"🔄 Continuing agentic loop (iteration {iteration})")
             
             # Save final assistant response
-            response_text = filter_thinking_blocks("".join(full_response))
+            # Use sanitize_user_facing_text for comprehensive cleanup (Clawdbot pattern)
+            response_text = sanitize_user_facing_text("".join(full_response))
             if response_text:
                 # Check for duplicate message before saving/sending
                 if self._deduplicator.is_duplicate(response_text):
@@ -1265,6 +1298,9 @@ class AgentRunner:
                     await self._session.add_message(session, "assistant", response_text)
                     # Record for future deduplication
                     self._deduplicator.record(response_text)
+            
+            # Record cache trace after completion
+            cache_trace.record_stage("session:after", messages=messages)
 
             # Final flush of any remaining buffered content with human delay
             for chunk in chunker.flush():
