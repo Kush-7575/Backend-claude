@@ -7,6 +7,7 @@ Notes = User-explicitly-saved content (notes table)
 These tools search/read memory from Supabase tables (persistent on Railway).
 Falls back to local files only if database unavailable.
 """
+import asyncio
 import logging
 import time
 from collections import OrderedDict
@@ -99,33 +100,55 @@ async def memory_search(
         if cached:
             return cached
 
-        # 1. Search memory sources (memory files, daily logs, sessions)
+        # Parallelize all search sources for speed (Clawdbot pattern)
+        # This reduces latency from ~2s sequential to ~0.5s parallel
+        search_tasks = []
+        task_sources = []
+        
+        # 1. Memory sources (memory files, daily logs, sessions)
         memory_sources = [s for s in sources if s in ["memory", "daily", "sessions"]]
         if memory_sources:
-            memory_results = await _memory_manager.search(
-                query=query,
-                limit=max_results,
-                sources=memory_sources,
-                use_hybrid=use_hybrid,
-                vector_weight=vector_weight,
-                text_weight=text_weight
+            search_tasks.append(
+                _memory_manager.search(
+                    query=query,
+                    limit=max_results,
+                    sources=memory_sources,
+                    use_hybrid=use_hybrid,
+                    vector_weight=vector_weight,
+                    text_weight=text_weight
+                )
             )
-            all_results.extend(memory_results)
+            task_sources.append("memory")
 
-        # 2. Search notes if included
+        # 2. Notes search
         if "notes" in sources:
-            note_results = await _search_notes_for_memory(
-                query,
-                max_results,
-                vector_weight=vector_weight,
-                text_weight=text_weight
+            search_tasks.append(
+                _search_notes_for_memory(
+                    query,
+                    max_results,
+                    vector_weight=vector_weight,
+                    text_weight=text_weight
+                )
             )
-            all_results.extend(note_results)
+            task_sources.append("notes")
 
-        # 3. Search reminders if included
+        # 3. Reminders search
         if "reminders" in sources:
-            reminder_results = await _search_reminders_for_memory(query, max_results)
-            all_results.extend(reminder_results)
+            search_tasks.append(
+                _search_reminders_for_memory(query, max_results)
+            )
+            task_sources.append("reminders")
+        
+        # Execute all searches in parallel
+        if search_tasks:
+            results_list = await asyncio.gather(*search_tasks, return_exceptions=True)
+            
+            for i, result in enumerate(results_list):
+                if isinstance(result, Exception):
+                    logger.warning(f"Search task {task_sources[i]} failed: {result}")
+                    continue
+                if isinstance(result, list):
+                    all_results.extend(result)
 
         # Apply role-aware source weighting
         all_results = _apply_source_weights(all_results, query)
@@ -287,13 +310,16 @@ async def _search_notes_for_memory(
         )
 
         for note in notes:
+            # Fix: Use 'or' to handle None values properly
+            title = note.get('title') or 'Untitled'
+            content = note.get('content') or ''
             results.append({
                 "source": "note",
-                "content": f"{note.get('title', 'Untitled')}: {note.get('content', '')[:300]}",
-                "title": note.get("title", ""),
-                "relevance": note.get("score", 0.5),
+                "content": f"{title}: {content[:300]}",
+                "title": title,
+                "relevance": note.get("score") or 0.5,
                 "id": note.get("id"),
-                "type": note.get("type", "note")
+                "type": note.get("type") or "note"
             })
 
     except Exception as e:

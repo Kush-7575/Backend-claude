@@ -496,35 +496,50 @@ class MemoryManager:
         sources = sources or ["daily", "memory", "notes", "sessions"]
         results = []
 
+        # Parallelize all searches for speed (Clawdbot pattern)
+        search_tasks = []
+        task_names = []
+
         # Search daily logs
         if "daily" in sources:
-            daily_results = await self._search_daily_logs(query, limit)
-            results.extend(daily_results)
+            search_tasks.append(self._search_daily_logs(query, limit))
+            task_names.append("daily")
 
         # Search MEMORY.md
         if "memory" in sources:
-            memory_results = await self._search_memory_file(query, limit)
-            results.extend(memory_results)
+            search_tasks.append(self._search_memory_file(query, limit))
+            task_names.append("memory")
 
         # Search notes - use hybrid vector search if available
         if "notes" in sources:
             if use_hybrid:
-                note_results = await self._search_notes_hybrid(
-                    query,
-                    limit,
-                    vector_weight=vector_weight,
-                    text_weight=text_weight
+                search_tasks.append(
+                    self._search_notes_hybrid(
+                        query, limit,
+                        vector_weight=vector_weight,
+                        text_weight=text_weight
+                    )
                 )
+                task_names.append("notes")
             elif self._supabase:
-                note_results = await self._search_notes(query, limit)
-            else:
-                note_results = []
-            results.extend(note_results)
+                search_tasks.append(self._search_notes(query, limit))
+                task_names.append("notes")
 
         # Search past sessions (from Clawdbot session indexing)
         if "sessions" in sources:
-            session_results = await self.search_sessions(query, user_id, limit)
-            results.extend(session_results)
+            search_tasks.append(self.search_sessions(query, user_id, limit))
+            task_names.append("sessions")
+
+        # Execute all searches in parallel
+        if search_tasks:
+            search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+            
+            for i, result in enumerate(search_results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Memory search {task_names[i]} failed: {result}")
+                    continue
+                if isinstance(result, list):
+                    results.extend(result)
 
         # Sort by relevance and limit
         results.sort(key=lambda x: x.get("relevance", 0), reverse=True)
@@ -554,13 +569,15 @@ class MemoryManager:
             )
 
             for note in notes:
+                # Fix: Use 'or' to handle None values properly
+                content = note.get("content") or ""
                 results.append({
                     "source": "notes_hybrid",
                     "id": note.get("id"),
-                    "title": note.get("title", ""),
-                    "content": note.get("content", "")[:300],
-                    "relevance": note.get("score", 0.5),  # Use hybrid score
-                    "type": note.get("type")
+                    "title": note.get("title") or "",
+                    "content": content[:300],
+                    "relevance": note.get("score") or 0.5,  # Use hybrid score
+                    "type": note.get("type") or "note"
                 })
 
             logger.info(f"Hybrid note search found {len(results)} results")
