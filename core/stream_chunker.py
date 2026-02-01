@@ -9,8 +9,15 @@ Also handles:
 - Thinking block filtering (<think>...</think>) - strips content
 - Final tag handling (<final>...</final>) - strips tags, keeps content
 - Code fence awareness (never breaks inside code blocks)
+- Inline code span protection (backticks)
 - Min/max character limits
 - Partial tag handling (tags split across chunks)
+
+Based on Clawdbot's:
+- pi-embedded-block-chunker.ts
+- pi-embedded-subscribe.ts (stripBlockTags)
+- markdown/code-spans.ts
+- markdown/fences.ts
 """
 import re
 import logging
@@ -20,21 +27,19 @@ from dataclasses import dataclass, field
 logger = logging.getLogger("brainmap.stream_chunker")
 
 # Regex patterns exactly matching Clawdbot's pi-embedded-subscribe.ts line 20-21
-THINKING_TAG_RE = re.compile(
-    r'<\s*(/?)' +
-    r'\s*' +
-    r'(?:think(?:ing)?|thought|antthinking)' +
-    r'\s*>',
+THINKING_TAG_SCAN_RE = re.compile(
+    r'<\s*(/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>',
     re.IGNORECASE
 )
 
-FINAL_TAG_RE = re.compile(
-    r'<\s*(/?)' +
-    r'\s*' +
-    r'final' +
-    r'\s*>',
+FINAL_TAG_SCAN_RE = re.compile(
+    r'<\s*(/?)\s*final\s*>',
     re.IGNORECASE
 )
+
+# For backwards compatibility
+THINKING_TAG_RE = THINKING_TAG_SCAN_RE
+FINAL_TAG_RE = FINAL_TAG_SCAN_RE
 
 
 @dataclass
@@ -43,6 +48,7 @@ class ChunkingConfig:
     min_chars: int = 50
     max_chars: int = 500
     break_preference: str = "paragraph"
+    enforce_final_tag: bool = False  # If True, only text inside <final> is shown
 
 
 @dataclass
@@ -56,23 +62,86 @@ class FenceSpan:
 
 
 @dataclass
+class InlineCodeSpan:
+    """Represents an inline code span (backticks)."""
+    start: int
+    end: int
+
+
+@dataclass
 class ChunkerState:
     """Tracks chunker state across streaming."""
     buffer: str = ""
     in_thinking: bool = False
     in_final: bool = False
+    ever_in_final: bool = False  # Track if we've ever seen <final>
     tag_buffer: str = ""  # Buffer for incomplete tags
     pending_fence_continuation: str = ""  # Fence opener to prepend to next chunk
 
 
-def strip_block_tags(text: str, state: ChunkerState) -> str:
+def build_code_span_index(text: str) -> List[InlineCodeSpan]:
     """
-    Strip thinking blocks and final tags from text (Clawdbot pattern).
+    Build index of inline code spans (Clawdbot markdown/code-spans.ts pattern).
     
-    - <think>...</think>: Remove entire block including content
-    - <final>...</final>: Keep content but remove the tags
+    Handles:
+    - Single backticks `code`
+    - Multiple backticks ``code`` or ```code```
+    - Escaped backticks
+    """
+    spans = []
+    i = 0
+    n = len(text)
+    
+    while i < n:
+        if text[i] == '`':
+            # Count consecutive backticks
+            start = i
+            tick_count = 0
+            while i < n and text[i] == '`':
+                tick_count += 1
+                i += 1
+            
+            # Skip if at end with no matching close
+            if i >= n:
+                break
+            
+            # Find matching closing backticks
+            close_start = text.find('`' * tick_count, i)
+            if close_start != -1:
+                close_end = close_start + tick_count
+                spans.append(InlineCodeSpan(start=start, end=close_end))
+                i = close_end
+            else:
+                # No matching close, continue
+                continue
+        else:
+            i += 1
+    
+    return spans
+
+
+def is_inside_code_span(pos: int, spans: List[InlineCodeSpan]) -> bool:
+    """Check if position is inside any inline code span."""
+    for span in spans:
+        if span.start <= pos < span.end:
+            return True
+    return False
+
+
+def strip_block_tags(text: str, state: ChunkerState, enforce_final: bool = False) -> str:
+    """
+    Strip thinking blocks and handle final tags (Clawdbot pattern).
+    
+    CRITICAL: Skips tags inside code spans to protect code examples.
+    
+    - <think>...</think>: Remove entire block including content (unless in code)
+    - <final>...</final>: 
+        - If enforce_final=True: ONLY return content inside <final>
+        - If enforce_final=False: Keep content but remove the tags
     - Stateful: tracks open tags across chunks
     - Handles partial tags split across chunks
+    
+    Based on Clawdbot's pi-embedded-subscribe.ts stripBlockTags function.
     """
     if not text:
         return text
@@ -81,53 +150,108 @@ def strip_block_tags(text: str, state: ChunkerState) -> str:
     combined = state.tag_buffer + text
     state.tag_buffer = ""
     
-    result = []
+    # Build inline code span index to protect code examples
+    code_spans = build_code_span_index(combined)
+    
+    # Pass 1: Handle <think> blocks (stateful, strip content inside)
+    processed = []
     i = 0
     
     while i < len(combined):
-        char = combined[i]
-        
-        # Check for start of potential tag
-        if char == '<':
-            # Look ahead for complete tag
+        # Check for potential tag at '<'
+        if combined[i] == '<':
+            # Skip if inside code span
+            if is_inside_code_span(i, code_spans):
+                if not state.in_thinking:
+                    processed.append(combined[i])
+                i += 1
+                continue
+            
             remaining = combined[i:]
             
             # Try to match thinking tag
-            think_match = THINKING_TAG_RE.match(remaining)
+            think_match = THINKING_TAG_SCAN_RE.match(remaining)
             if think_match:
                 is_close = think_match.group(1) == "/"
                 if is_close:
-                    # </think> - end of thinking block
                     state.in_thinking = False
                 else:
-                    # <think> - start of thinking block
                     state.in_thinking = True
                 i += think_match.end()
                 continue
             
-            # Try to match final tag
-            final_match = FINAL_TAG_RE.match(remaining)
-            if final_match:
-                # Just skip the tag, keep processing content
-                i += final_match.end()
-                continue
-            
-            # Check if this might be an incomplete tag
-            # If we're near the end and have '<' with potential tag chars
-            if i >= len(combined) - 15:  # Could be partial tag
-                # Buffer the rest for next chunk
+            # Check for incomplete tag near end
+            if i >= len(combined) - 20:
+                # Could be partial tag - buffer for next chunk
                 state.tag_buffer = combined[i:]
                 break
             
-            # Not a tag we care about, pass through
+            # Not a thinking tag, pass through
             if not state.in_thinking:
-                result.append(char)
+                processed.append(combined[i])
             i += 1
         else:
-            # Regular character
             if not state.in_thinking:
-                result.append(char)
+                processed.append(combined[i])
             i += 1
+    
+    after_thinking = ''.join(processed)
+    
+    # Pass 2: Handle <final> blocks
+    if not enforce_final:
+        # Just strip the tags, keep all content
+        code_spans_2 = build_code_span_index(after_thinking)
+        result = []
+        i = 0
+        while i < len(after_thinking):
+            if after_thinking[i] == '<' and not is_inside_code_span(i, code_spans_2):
+                remaining = after_thinking[i:]
+                final_match = FINAL_TAG_SCAN_RE.match(remaining)
+                if final_match:
+                    i += final_match.end()
+                    continue
+            result.append(after_thinking[i])
+            i += 1
+        return ''.join(result)
+    
+    # enforce_final=True: ONLY return text inside <final> blocks
+    code_spans_2 = build_code_span_index(after_thinking)
+    result = []
+    in_final = state.in_final
+    ever_in_final = state.ever_in_final
+    last_final_idx = 0
+    i = 0
+    
+    while i < len(after_thinking):
+        if after_thinking[i] == '<' and not is_inside_code_span(i, code_spans_2):
+            remaining = after_thinking[i:]
+            final_match = FINAL_TAG_SCAN_RE.match(remaining)
+            if final_match:
+                is_close = final_match.group(1) == "/"
+                if not in_final and not is_close:
+                    # <final> start
+                    in_final = True
+                    ever_in_final = True
+                    last_final_idx = i + final_match.end()
+                elif in_final and is_close:
+                    # </final> end - capture content
+                    result.append(after_thinking[last_final_idx:i])
+                    in_final = False
+                    last_final_idx = i + final_match.end()
+                i += final_match.end()
+                continue
+        i += 1
+    
+    # Handle unclosed <final>
+    if in_final:
+        result.append(after_thinking[last_final_idx:])
+    
+    state.in_final = in_final
+    state.ever_in_final = ever_in_final
+    
+    # If we've never seen a <final> tag, return nothing (strict mode)
+    if not ever_in_final:
+        return ""
     
     return ''.join(result)
 
@@ -154,8 +278,12 @@ class StreamBlockChunker:
         if not text:
             return []
         
-        # Filter thinking blocks and strip final tags
-        filtered = strip_block_tags(text, self.state)
+        # Filter thinking blocks and strip/handle final tags
+        filtered = strip_block_tags(
+            text, 
+            self.state,
+            enforce_final=self.config.enforce_final_tag
+        )
         if not filtered:
             return []
         

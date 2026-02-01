@@ -7,14 +7,17 @@ The central orchestrator for agent conversations with:
 3. Streaming responses
 4. Error handling and failover
 5. Integration with Session and Memory managers
+6. Steering queue for mid-run interruption (pi-agent pattern)
+7. Message transformation for cross-provider compatibility
+8. Turn lifecycle events
 
-Based on Clawdbot's agent loop patterns.
+Based on Clawdbot's agent loop patterns (pi-agent + embedded runner).
 """
 import logging
 import re
 import random
-from typing import List, Dict, Any, Optional, AsyncIterator, Callable
-from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, AsyncIterator, Callable, Awaitable
+from dataclasses import dataclass, field
 import asyncio
 from datetime import datetime, timezone
 
@@ -29,6 +32,11 @@ from core.config import settings
 from core.session import Session, SessionManager
 from core.context import get_context_manager
 from core.stream_chunker import create_stream_chunker, StreamBlockChunker
+from core.message_transform import (
+    transform_messages,
+    TransformConfig,
+    prune_tool_results_in_messages
+)
 from core.errors import (
     classify_error,
     ErrorType,
@@ -159,6 +167,82 @@ class MessageDeduplicator:
     def clear(self) -> None:
         """Clear all recorded messages."""
         self._sent.clear()
+
+
+class MessagingToolTracker:
+    """
+    Track messaging tool calls with pending/committed pattern (from Clawdbot pi-agent).
+    
+    This prevents duplicate messages when a tool call is retried or if the same
+    message text is sent via multiple tool calls.
+    
+    Pattern:
+    1. Before tool exec: mark_pending(tool_call_id, message_text)
+    2. After successful send: commit(tool_call_id)
+    3. Check is_duplicate() before allowing send
+    
+    From pi-embedded-subscribe.handlers.tools.ts:
+    - pendingMessagingTexts: Map<string, string>
+    - commitMessagingToolCall(toolCallId)
+    - isMessagingTextDuplicate(text)
+    """
+    
+    def __init__(self, max_committed: int = MAX_SENT_TEXTS):
+        self._pending: Dict[str, str] = {}  # tool_call_id -> text
+        self._committed: List[str] = []  # committed texts (normalized)
+        self._max_committed = max_committed
+        
+    def mark_pending(self, tool_call_id: str, text: str) -> None:
+        """Mark a messaging tool call as pending (about to send)."""
+        self._pending[tool_call_id] = text
+        
+    def commit(self, tool_call_id: str) -> None:
+        """
+        Commit a messaging tool call (send succeeded).
+        
+        Moves the text from pending to committed list for dedup checking.
+        """
+        text = self._pending.pop(tool_call_id, None)
+        if text:
+            normalized = normalize_text_for_comparison(text)
+            if normalized and len(normalized) >= MIN_DUPLICATE_TEXT_LENGTH:
+                self._committed.append(normalized)
+                # Circular buffer
+                while len(self._committed) > self._max_committed:
+                    self._committed.pop(0)
+    
+    def rollback(self, tool_call_id: str) -> None:
+        """Rollback a pending messaging tool call (send failed/aborted)."""
+        self._pending.pop(tool_call_id, None)
+    
+    def is_duplicate(self, text: str) -> bool:
+        """
+        Check if text is a duplicate of a committed or pending message.
+        
+        Checks both committed messages and pending messages to catch
+        duplicates even within the same turn.
+        """
+        normalized = normalize_text_for_comparison(text)
+        if not normalized or len(normalized) < MIN_DUPLICATE_TEXT_LENGTH:
+            return False
+        
+        # Check committed
+        for committed_norm in self._committed:
+            if normalized in committed_norm or committed_norm in normalized:
+                return True
+        
+        # Check pending
+        for pending_text in self._pending.values():
+            pending_norm = normalize_text_for_comparison(pending_text)
+            if pending_norm and (normalized in pending_norm or pending_norm in normalized):
+                return True
+        
+        return False
+    
+    def clear(self) -> None:
+        """Clear all tracking."""
+        self._pending.clear()
+        self._committed.clear()
 
 
 def is_silent_reply(text: str) -> bool:
@@ -312,6 +396,13 @@ class StreamChunk:
     metadata: Optional[Dict[str, Any]] = None
 
 
+@dataclass
+class SteeringMessage:
+    """A steering message to interrupt the agent mid-run."""
+    content: str
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class AgentRunner:
     """
     Runs agent conversations with Claude.
@@ -322,13 +413,19 @@ class AgentRunner:
     3. Handles tool execution
     4. Streams responses
     5. Manages errors with retry/failover
+    6. Supports steering (mid-run interruption)
+    7. Supports follow-up messages
+    8. Emits turn lifecycle events
+    
+    Based on pi-agent's Agent class + Clawdbot's embedded runner.
     """
     
     def __init__(
         self,
         session_manager: SessionManager,
         tool_registry: Optional[Any] = None,
-        prompt_builder: Optional[Any] = None
+        prompt_builder: Optional[Any] = None,
+        transform_context: Optional[Callable[[List[Dict]], Awaitable[List[Dict]]]] = None
     ):
         """
         Initialize agent runner.
@@ -337,17 +434,109 @@ class AgentRunner:
             session_manager: For session state and compaction
             tool_registry: Tool definitions and execution
             prompt_builder: System prompt construction
+            transform_context: Optional hook to transform messages before LLM call
         """
         self._session = session_manager
         self._tools = tool_registry
         self._prompt = prompt_builder
         self._context = get_context_manager()
         self._client = None
+        
+        # Message transformation (pi-agent pattern)
+        self._transform_context = transform_context
+        
+        # Steering queue (pi-agent pattern)
+        # Messages added here interrupt the current run after tool execution
+        self._steering_queue: List[SteeringMessage] = []
+        
+        # Follow-up queue (pi-agent pattern)
+        # Messages added here are processed after the agent would normally stop
+        self._follow_up_queue: List[SteeringMessage] = []
+        
+        # Steering mode: "all" = send all at once, "one-at-a-time" = one per turn
+        self._steering_mode: str = "one-at-a-time"
+        self._follow_up_mode: str = "one-at-a-time"
+        
         # Message deduplication (from Clawdbot)
         self._deduplicator = MessageDeduplicator()
+        
+        # Messaging tool dedup with pending/committed tracking (pi-agent pattern)
+        self._messaging_tracker = MessagingToolTracker()
+        
         # Agent lifecycle hooks (from Clawdbot)
         self._pre_hooks: List[Callable] = []
         self._post_hooks: List[Callable] = []
+        
+        # Running state
+        self._is_streaming = False
+        self._abort_controller: Optional[asyncio.Event] = None
+
+    def steer(self, message: str) -> None:
+        """
+        Queue a steering message to interrupt the agent mid-run.
+        
+        From pi-agent: Delivered after current tool execution, skips remaining tools.
+        """
+        self._steering_queue.append(SteeringMessage(content=message))
+        logger.debug(f"Steering message queued: {message[:50]}...")
+
+    def follow_up(self, message: str) -> None:
+        """
+        Queue a follow-up message to be processed after agent finishes.
+        
+        From pi-agent: Delivered only when agent has no more tool calls or steering.
+        """
+        self._follow_up_queue.append(SteeringMessage(content=message))
+        logger.debug(f"Follow-up message queued: {message[:50]}...")
+
+    def clear_steering_queue(self) -> None:
+        """Clear all steering messages."""
+        self._steering_queue.clear()
+
+    def clear_follow_up_queue(self) -> None:
+        """Clear all follow-up messages."""
+        self._follow_up_queue.clear()
+
+    def clear_all_queues(self) -> None:
+        """Clear both steering and follow-up queues."""
+        self._steering_queue.clear()
+        self._follow_up_queue.clear()
+
+    def abort(self) -> None:
+        """Abort the current run."""
+        if self._abort_controller:
+            self._abort_controller.set()
+
+    async def _get_steering_messages(self) -> List[str]:
+        """Get pending steering messages (pi-agent pattern)."""
+        if not self._steering_queue:
+            return []
+        
+        if self._steering_mode == "one-at-a-time":
+            msg = self._steering_queue.pop(0)
+            return [msg.content]
+        else:
+            messages = [m.content for m in self._steering_queue]
+            self._steering_queue.clear()
+            return messages
+
+    async def _get_follow_up_messages(self) -> List[str]:
+        """Get pending follow-up messages (pi-agent pattern)."""
+        if not self._follow_up_queue:
+            return []
+        
+        if self._follow_up_mode == "one-at-a-time":
+            msg = self._follow_up_queue.pop(0)
+            return [msg.content]
+        else:
+            messages = [m.content for m in self._follow_up_queue]
+            self._follow_up_queue.clear()
+            return messages
+
+    @property
+    def is_streaming(self) -> bool:
+        """Check if agent is currently streaming."""
+        return self._is_streaming
 
     def add_pre_hook(self, hook: Callable) -> None:
         """Register a pre-turn hook (may modify user_message)."""
@@ -460,37 +649,30 @@ class AgentRunner:
         self,
         messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Trim oversized tool_result blocks to keep prompts small."""
+        """
+        Prune oversized tool_result blocks using soft-trim + hard-clear.
+        
+        Uses the new message_transform.prune_tool_results_in_messages
+        which implements Clawdbot's two-phase pruning:
+        1. Soft-trim: Keep head + tail of large results
+        2. Hard-clear: Replace very large results with placeholder
+        """
+        # Use soft-trim threshold (4000 chars) and hard-clear threshold
         hard_clear_min = max(0, int(settings.CONTEXT_PRUNE_HARD_CLEAR_MIN_CHARS))
         placeholder = settings.CONTEXT_PRUNE_HARD_CLEAR_PLACEHOLDER
+        
         if hard_clear_min <= 0:
             return messages
-
-        pruned: List[Dict[str, Any]] = []
-        for msg in messages:
-            content = msg.get("content")
-            if not isinstance(content, list):
-                pruned.append(msg)
-                continue
-            new_blocks = []
-            changed = False
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    raw = block.get("content", "")
-                    if isinstance(raw, str) and len(raw) > hard_clear_min:
-                        new_block = dict(block)
-                        new_block["content"] = placeholder
-                        new_blocks.append(new_block)
-                        changed = True
-                        continue
-                new_blocks.append(block)
-            if changed:
-                new_msg = dict(msg)
-                new_msg["content"] = new_blocks
-                pruned.append(new_msg)
-            else:
-                pruned.append(msg)
-        return pruned
+        
+        # Soft-trim at 4000 chars, hard-clear at the configured threshold
+        return prune_tool_results_in_messages(
+            messages,
+            max_chars=4000,  # Soft-trim threshold
+            head_chars=1500,
+            tail_chars=500,
+            hard_clear_threshold=hard_clear_min,
+            hard_clear_placeholder=placeholder
+        )
     async def _prefetch_memory(self, user_message: str) -> Optional[str]:
         """Prefetch memory_search results and format for prompt injection."""
         if not self._should_prefetch_memory(user_message):
@@ -778,6 +960,17 @@ class AgentRunner:
         messages = self._context.soft_trim_messages(raw_messages)
         messages = self._prune_tool_results_in_messages(messages)
         
+        # Message transformation for cross-provider compatibility (pi-agent pattern)
+        # Handles: orphaned tool calls, ID normalization, errored message removal
+        messages = transform_messages(messages, TransformConfig())
+        
+        # Apply optional transformContext hook (pi-agent pattern)
+        if self._transform_context:
+            try:
+                messages = await self._transform_context(messages)
+            except Exception as e:
+                logger.warning(f"transformContext hook failed: {e}")
+        
         # Build system prompt with context for memory retrieval
         prompt_report = None
         if system_prompt is None and self._prompt:
@@ -837,8 +1030,25 @@ class AgentRunner:
             )
             
             last_streamed_norm: Optional[str] = None
+            self._is_streaming = True
+            self._abort_controller = asyncio.Event()
+            
             while iteration < max_iterations:
                 iteration += 1
+                
+                # Check for abort
+                if self._abort_controller.is_set():
+                    logger.info("Agent run aborted by abort controller")
+                    yield StreamChunk(type="lifecycle", content="aborted", metadata={"phase": "aborted"})
+                    break
+                
+                # Emit turn_start event (pi-agent pattern)
+                yield StreamChunk(
+                    type="lifecycle",
+                    content="turn_start",
+                    metadata={"phase": "turn_start", "turn": iteration}
+                )
+                
                 messages = self._prune_tool_results_in_messages(messages)
                 tool_calls = []
                 current_response = []
@@ -941,6 +1151,22 @@ class AgentRunner:
                                 continue
                             last_streamed_norm = norm or last_streamed_norm
                         yield StreamChunk(type="text", content=chunk)
+                    
+                    # Emit turn_end event (pi-agent pattern)
+                    yield StreamChunk(
+                        type="lifecycle",
+                        content="turn_end",
+                        metadata={"phase": "turn_end", "turn": iteration, "has_tool_calls": len(tool_calls) > 0}
+                    )
+                    
+                    # Check for follow-up messages (pi-agent pattern)
+                    follow_ups = await self._get_follow_up_messages()
+                    if follow_ups:
+                        for fu_msg in follow_ups:
+                            logger.info(f"Processing follow-up message: {fu_msg[:50]}...")
+                            messages.append({"role": "user", "content": fu_msg})
+                        continue  # Keep the loop going
+                    
                     # No tools called or Claude finished - we're done!
                     break
                 
@@ -1012,6 +1238,21 @@ class AgentRunner:
                 # Add tool results as user message
                 messages.append({"role": "user", "content": tool_results})
                 
+                # Emit turn_end event after tool execution (pi-agent pattern)
+                yield StreamChunk(
+                    type="lifecycle",
+                    content="turn_end",
+                    metadata={"phase": "turn_end", "turn": iteration, "has_tool_calls": True}
+                )
+                
+                # Check for steering messages (pi-agent pattern)
+                # Steering messages interrupt after tool execution
+                steering_msgs = await self._get_steering_messages()
+                if steering_msgs:
+                    logger.info(f"Steering message received, adding to context")
+                    for steer_msg in steering_msgs:
+                        messages.append({"role": "user", "content": steer_msg})
+                
                 logger.info(f"🔄 Continuing agentic loop (iteration {iteration})")
             
             # Save final assistant response
@@ -1064,6 +1305,11 @@ class AgentRunner:
         except Exception as e:
             logger.error(f"Stream error: {e}")
             yield StreamChunk(type="error", content=str(e))
+        
+        finally:
+            # Clean up streaming state
+            self._is_streaming = False
+            self._abort_controller = None
     
     def _add_cache_control_to_messages(
         self,
