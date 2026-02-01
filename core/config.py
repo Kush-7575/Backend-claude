@@ -59,12 +59,12 @@ class Settings(BaseSettings):
         description="Directory for file-based memory storage"
     )
     WORKSPACE_FILE_MAX_CHARS: int = Field(
-        default=4000,
-        description="Max characters to inject per workspace file"
+        default=2000,
+        description="Max characters to inject per workspace file (reduced for efficiency)"
     )
     WORKSPACE_TOTAL_MAX_CHARS: int = Field(
-        default=12000,
-        description="Max total characters to inject from workspace files"
+        default=6000,
+        description="Max total characters to inject from workspace files (reduced for efficiency)"
     )
     WORKSPACE_TRIM_HEAD_RATIO: float = Field(
         default=0.7,
@@ -75,12 +75,12 @@ class Settings(BaseSettings):
         description="Tail ratio for workspace truncation"
     )
     PROMPT_SECTION_TOKEN_BUDGETS: Dict[str, int] = Field(
-        default_factory=dict,
+        default_factory=lambda: {"workspace": 2000, "skills": 1000},
         description="Per-section token budgets for system prompt"
     )
     PROMPT_TOTAL_TOKEN_BUDGET: int = Field(
-        default=0,
-        description="Max total tokens for system prompt (0 = no cap)"
+        default=5000,
+        description="Max total tokens for system prompt (5000 = efficient cap)"
     )
     EMBEDDING_PROVIDER: str = Field(
         default="openai",
