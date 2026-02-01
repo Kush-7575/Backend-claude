@@ -151,7 +151,11 @@ async def send_message(request: SendMessageRequest):
             async for chunk in agent.run_stream(session, request.message):
                 chunk_count += 1
                 if chunk.type == "text":
-                    yield f"data: {chunk.content}\n\n"
+                    # Include metadata with delta and accumulated (Clawdbot pattern)
+                    if chunk.metadata:
+                        yield f"data: {json.dumps({'content': chunk.content, 'metadata': chunk.metadata})}\n\n"
+                    else:
+                        yield f"data: {chunk.content}\n\n"
                 elif chunk.type == "tool_start":
                     yield f"think: Using {chunk.content}...\n\n"
                 elif chunk.type == "tool_end":
