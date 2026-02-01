@@ -31,7 +31,12 @@ from tenacity import (
 from core.config import settings
 from core.session import Session, SessionManager
 from core.context import get_context_manager
-from core.stream_chunker import create_stream_chunker, StreamBlockChunker
+from core.stream_chunker import (
+    create_stream_chunker,
+    StreamBlockChunker,
+    strip_block_tags,
+    ChunkerState as StreamChunkerState
+)
 from core.message_transform import (
     transform_messages,
     TransformConfig,
@@ -1061,7 +1066,15 @@ class AgentRunner:
                 break_preference="paragraph"  # Preserve markdown boundaries (lists, paragraphs)
             )
             
+            # Clawdbot pattern: track accumulated text for monotonic guarantee
             last_streamed_norm: Optional[str] = None
+            accumulated_text = ""  # Full accumulated response text
+            last_accumulated_sent = ""  # Last accumulated sent (for monotonic check)
+            message_started = False  # Track if we've emitted message_start
+            
+            # State for real-time thinking block stripping (Clawdbot pattern)
+            stream_chunker_state = StreamChunkerState()
+            
             self._is_streaming = True
             self._abort_controller = asyncio.Event()
             
@@ -1123,18 +1136,52 @@ class AgentRunner:
                                 text = event.delta.text
                                 current_response.append(text)
                                 full_response.append(text)
+                                
+                                # Clawdbot pattern: Emit message_start before first text
+                                if not message_started:
+                                    message_started = True
+                                    yield StreamChunk(
+                                        type="lifecycle",
+                                        content="message_start",
+                                        metadata={"phase": "message_start", "role": "assistant"}
+                                    )
 
                                 # Use chunker for smoother streaming with human-like delays
                                 if text:
                                     for chunk in chunker.process(text):
                                         # Apply human delay between chunks (not first)
                                         await apply_human_delay(is_first_chunk=(len(full_response) == 1))
+                                        
+                                        # Real-time thinking block strip (Clawdbot pattern)
+                                        cleaned_chunk = strip_block_tags(chunk, stream_chunker_state)
+                                        if not cleaned_chunk or not cleaned_chunk.strip():
+                                            continue  # Skip empty chunks after stripping
+                                        
+                                        # Track accumulated text for monotonic guarantee
+                                        accumulated_text += cleaned_chunk
+                                        
+                                        # Monotonic text guarantee (Clawdbot pattern)
+                                        # Ensure accumulated only grows, never shrinks
+                                        if last_accumulated_sent and not accumulated_text.startswith(last_accumulated_sent):
+                                            logger.warning("Non-monotonic stream detected, skipping chunk")
+                                            continue
+                                        
                                         if settings.STREAM_DEDUPLICATE_CHUNKS:
-                                            norm = normalize_text_for_comparison(chunk)
+                                            norm = normalize_text_for_comparison(cleaned_chunk)
                                             if norm and norm == last_streamed_norm:
                                                 continue
                                             last_streamed_norm = norm or last_streamed_norm
-                                        yield StreamChunk(type="text", content=chunk)
+                                        
+                                        # Emit with both delta and accumulated (Clawdbot pattern)
+                                        last_accumulated_sent = accumulated_text
+                                        yield StreamChunk(
+                                            type="text",
+                                            content=cleaned_chunk,
+                                            metadata={
+                                                "delta": cleaned_chunk,
+                                                "accumulated": accumulated_text
+                                            }
+                                        )
                             
                             elif delta_type == "input_json_delta":
                                 # Tool input being built - accumulate JSON
@@ -1177,12 +1224,29 @@ class AgentRunner:
                     # Flush any remaining buffered content with human delay
                     for chunk in chunker.flush():
                         await apply_human_delay(is_first_chunk=False)
+                        
+                        # Real-time thinking block strip (Clawdbot pattern)
+                        cleaned_chunk = strip_block_tags(chunk, stream_chunker_state)
+                        if not cleaned_chunk or not cleaned_chunk.strip():
+                            continue
+                        
+                        accumulated_text += cleaned_chunk
+                        
                         if settings.STREAM_DEDUPLICATE_CHUNKS:
-                            norm = normalize_text_for_comparison(chunk)
+                            norm = normalize_text_for_comparison(cleaned_chunk)
                             if norm and norm == last_streamed_norm:
                                 continue
                             last_streamed_norm = norm or last_streamed_norm
-                        yield StreamChunk(type="text", content=chunk)
+                        
+                        last_accumulated_sent = accumulated_text
+                        yield StreamChunk(
+                            type="text",
+                            content=cleaned_chunk,
+                            metadata={
+                                "delta": cleaned_chunk,
+                                "accumulated": accumulated_text
+                            }
+                        )
                     
                     # Emit turn_end event (pi-agent pattern)
                     yield StreamChunk(
@@ -1305,12 +1369,43 @@ class AgentRunner:
             # Final flush of any remaining buffered content with human delay
             for chunk in chunker.flush():
                 await apply_human_delay(is_first_chunk=False)
+                
+                # Real-time thinking block strip (Clawdbot pattern)
+                cleaned_chunk = strip_block_tags(chunk, stream_chunker_state)
+                if not cleaned_chunk or not cleaned_chunk.strip():
+                    continue
+                
+                accumulated_text += cleaned_chunk
+                
                 if settings.STREAM_DEDUPLICATE_CHUNKS:
-                    norm = normalize_text_for_comparison(chunk)
+                    norm = normalize_text_for_comparison(cleaned_chunk)
                     if norm and norm == last_streamed_norm:
                         continue
                     last_streamed_norm = norm or last_streamed_norm
-                yield StreamChunk(type="text", content=chunk)
+                
+                last_accumulated_sent = accumulated_text
+                yield StreamChunk(
+                    type="text",
+                    content=cleaned_chunk,
+                    metadata={
+                        "delta": cleaned_chunk,
+                        "accumulated": accumulated_text
+                    }
+                )
+            
+            # Clawdbot pattern: Emit message_end with final cleaned text
+            # This is the "source of truth" for what the AI actually said
+            if message_started:
+                yield StreamChunk(
+                    type="lifecycle",
+                    content="message_end",
+                    metadata={
+                        "phase": "message_end",
+                        "role": "assistant",
+                        "text": response_text,  # Final sanitized text
+                        "accumulated": accumulated_text  # Raw accumulated
+                    }
+                )
 
             # Auto memory capture (from Clawdbot lifecycle hooks)
             # Capture important memories after each exchange
