@@ -18,17 +18,80 @@ Builds system prompts from discrete sections:
 14. Runtime Info - Agent self-awareness (Clawdbot)
 
 Based on Clawdbot's system-prompt.ts patterns.
+
+Performance optimizations (from Clawdbot):
+- Workspace file cache with mtime-based invalidation
+- Parallel prompt section building
+- Token count memoization
 """
 import logging
 import re
+import asyncio
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable, Tuple
 from pathlib import Path
+from time import time as time_now
 
 from core.config import settings
 from tools.registry import get_tool_registry
 from tools.policy import get_tool_policy
 from core.context import get_context_manager
+
+
+# =============================================================================
+# Workspace File Cache (from Clawdbot session-manager-cache.ts pattern)
+# =============================================================================
+
+# Cache entry: (mtime, content, loaded_at)
+_workspace_file_cache: Dict[str, Tuple[float, str, float]] = {}
+WORKSPACE_CACHE_TTL_SECONDS = 45  # Matches Clawdbot's 45s TTL
+
+
+def _is_workspace_cache_valid(filepath: str) -> bool:
+    """Check if cached workspace file is still valid."""
+    if filepath not in _workspace_file_cache:
+        return False
+    mtime, content, loaded_at = _workspace_file_cache[filepath]
+    
+    # Check TTL
+    if time_now() - loaded_at > WORKSPACE_CACHE_TTL_SECONDS:
+        return False
+    
+    # Check mtime hasn't changed
+    try:
+        current_mtime = Path(filepath).stat().st_mtime
+        return current_mtime == mtime
+    except (OSError, FileNotFoundError):
+        return False
+
+
+def _read_workspace_file_cached(filepath: Path) -> str:
+    """
+    Read workspace file with mtime-based cache (Clawdbot pattern).
+    
+    This eliminates redundant file I/O for bootstrap files that
+    rarely change during a session.
+    """
+    filepath_str = str(filepath)
+    
+    # Check cache validity
+    if _is_workspace_cache_valid(filepath_str):
+        _, content, _ = _workspace_file_cache[filepath_str]
+        return content
+    
+    # Cache miss - read file
+    try:
+        content = filepath.read_text(encoding="utf-8")
+        mtime = filepath.stat().st_mtime
+        _workspace_file_cache[filepath_str] = (mtime, content, time_now())
+        return content
+    except (OSError, FileNotFoundError):
+        return ""
+
+
+def clear_workspace_cache() -> None:
+    """Clear the workspace file cache (for testing)."""
+    _workspace_file_cache.clear()
 
 
 # Cache TTL constants (from Clawdbot cache-ttl.ts)
@@ -247,18 +310,70 @@ class PromptBuilder:
         total_tokens = sum(s["tokens"] for s in section_data if s["content"])
         return {"prompt": prompt, "total_tokens": total_tokens, "sections": section_data}
 
+    # Sections that can be built in parallel (no dependencies)
+    # These are pure string builders with no shared state
+    PARALLEL_SAFE_SECTIONS = {
+        "identity", "time", "critical_rules", "tool_call_style",
+        "reasoning_format", "memory_recall", "response_style",
+        "silent_replies", "heartbeat", "runtime_info"
+    }
+
     async def _build_sections(
         self,
         user_id: str,
         context: Dict[str, Any],
         sections: List[str]
     ) -> List[Dict[str, Any]]:
-        data: List[Dict[str, Any]] = []
+        """
+        Build prompt sections with parallel execution (Clawdbot Promise.all pattern).
+        
+        Independent sections are built concurrently using asyncio.gather,
+        while order-dependent sections are built sequentially.
+        """
+        # Separate parallel-safe vs sequential sections while preserving order
+        parallel_sections = []
+        sequential_sections = []
+        section_order = []  # Track original order
+        
         for section in sections:
             builder = getattr(self, f"_build_{section}", None)
             if not builder:
                 continue
-            content = await builder(user_id, context)
+            section_order.append(section)
+            if section in self.PARALLEL_SAFE_SECTIONS:
+                parallel_sections.append((section, builder))
+            else:
+                sequential_sections.append((section, builder))
+        
+        # Build parallel sections concurrently (Clawdbot Promise.all pattern)
+        parallel_results: Dict[str, str] = {}
+        if parallel_sections:
+            tasks = [builder(user_id, context) for _, builder in parallel_sections]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, (section, _) in enumerate(parallel_sections):
+                result = results[i]
+                if isinstance(result, Exception):
+                    logger.warning(f"Section {section} failed: {result}")
+                    parallel_results[section] = ""
+                else:
+                    parallel_results[section] = result or ""
+        
+        # Build sequential sections one by one
+        sequential_results: Dict[str, str] = {}
+        for section, builder in sequential_sections:
+            try:
+                content = await builder(user_id, context)
+                sequential_results[section] = content or ""
+            except Exception as e:
+                logger.warning(f"Section {section} failed: {e}")
+                sequential_results[section] = ""
+        
+        # Merge results in original order
+        all_results = {**parallel_results, **sequential_results}
+        data: List[Dict[str, Any]] = []
+        
+        for section in section_order:
+            content = all_results.get(section, "")
             if not content:
                 continue
             tokens = self._context.count_tokens(content)
@@ -398,10 +513,11 @@ Use this timezone when interpreting time-related requests like "at 5pm" or "tomo
                     "content": "",
                 })
                 continue
-            try:
-                content = filepath.read_text(encoding="utf-8")
-            except Exception as e:
-                logger.warning(f"Failed to read {filepath}: {e}")
+            
+            # Use cached file reading (Clawdbot pattern)
+            content = _read_workspace_file_cached(filepath)
+            if not content:
+                logger.warning(f"Failed to read {filepath}")
                 report.append({
                     "name": filename,
                     "path": str(filepath),

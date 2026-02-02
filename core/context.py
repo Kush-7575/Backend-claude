@@ -9,17 +9,69 @@ Key responsibilities:
 3. Trigger compaction when approaching limits
 4. Coordinate with Memory Manager for pre-compaction flush
 5. Pre-flight context window guard (from Clawdbot)
+
+Performance optimizations:
+- Token count memoization with LRU cache (Clawdbot pattern)
 """
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 import tiktoken
 
 from core.config import settings
 from core.failover import FailoverError, FailoverReason
 
 logger = logging.getLogger("brainmap.context")
+
+
+# =============================================================================
+# Token Count Cache (Clawdbot pattern - memoize expensive tokenization)
+# =============================================================================
+
+# Global tiktoken encoding for memoized function
+_global_encoding = None
+
+def _get_global_encoding():
+    """Get or create global tiktoken encoding."""
+    global _global_encoding
+    if _global_encoding is None:
+        try:
+            _global_encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            logger.warning(f"Failed to load tiktoken: {e}")
+    return _global_encoding
+
+
+@lru_cache(maxsize=512)
+def _count_tokens_cached(text: str) -> int:
+    """
+    Memoized token counting (Clawdbot pattern).
+    
+    Caches up to 512 unique text strings to avoid redundant
+    tokenization of the same content (e.g., system prompts,
+    repeated message blocks).
+    """
+    if not text:
+        return 0
+    
+    encoding = _get_global_encoding()
+    if encoding:
+        return len(encoding.encode(text))
+    else:
+        # Rough approximation: ~4 chars per token
+        return len(text) // 4
+
+
+def clear_token_cache() -> None:
+    """Clear the token count cache (for testing)."""
+    _count_tokens_cached.cache_clear()
+
+
+def get_token_cache_info():
+    """Get cache statistics for diagnostics."""
+    return _count_tokens_cached.cache_info()
 
 
 # Context window guard constants (from Clawdbot context-window-guard.ts)
@@ -260,16 +312,10 @@ class ContextManager:
         """
         Count tokens in a text string.
         
-        Uses tiktoken for accurate counting, falls back to approximation.
+        Uses memoized token counting for performance (Clawdbot pattern).
+        Caches results to avoid redundant tokenization of repeated content.
         """
-        if not text:
-            return 0
-        
-        if self._encoding:
-            return len(self._encoding.encode(text))
-        else:
-            # Rough approximation: ~4 chars per token
-            return len(text) // 4
+        return _count_tokens_cached(text)
 
     def truncate_text_to_tokens(self, text: str, max_tokens: int) -> str:
         """Truncate text to a maximum number of tokens."""

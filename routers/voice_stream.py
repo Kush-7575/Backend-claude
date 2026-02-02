@@ -532,8 +532,9 @@ async def process_transcript_with_agent(
             "responded": True
         })
         
-        # Save session
-        await _session_manager.save_session(session)
+        # Save session in background (Clawdbot fire-and-forget pattern)
+        # This reduces perceived latency by not waiting for DB write
+        _session_manager.save_session_background(session)
     
     except Exception as e:
         logger.error(f"Agent processing error: {e}")

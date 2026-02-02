@@ -173,8 +173,9 @@ async def send_message(request: SendMessageRequest):
 
             logger.info(f"Agent stream completed with {chunk_count} chunks")
 
-            # Save session after response
-            await sessions.save_session(session)
+            # Save session in background (Clawdbot fire-and-forget pattern)
+            # This reduces perceived latency by not waiting for DB write
+            sessions.save_session_background(session)
 
             # Keep SSE open briefly for background subagent announcements
             if settings.SUBAGENT_ANNOUNCE_PUSH_ENABLED:

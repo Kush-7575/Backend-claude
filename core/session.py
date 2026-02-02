@@ -7,16 +7,66 @@ Manages conversation sessions with:
 3. Memory flush before compaction (via MemoryManager)
 
 Based on Clawdbot's session management patterns.
+
+Performance optimizations:
+- Session cache with TTL (Clawdbot session-manager-cache.ts pattern)
+- Background session save (fire-and-forget)
 """
 import logging
-from typing import List, Dict, Any, Optional
+import asyncio
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import uuid4
+from time import time as time_now
 import json
 
 from core.config import settings
 from core.context import get_context_manager, ContextMetrics
+
+
+# =============================================================================
+# Session Cache with TTL (Clawdbot session-manager-cache.ts pattern)
+# =============================================================================
+
+# Cache TTL matches Clawdbot's 45s default
+SESSION_CACHE_TTL_SECONDS = 45
+
+# Cache entry: (session, loaded_at)
+_session_cache: Dict[str, Tuple["Session", float]] = {}
+
+
+def _is_session_cache_valid(session_id: str) -> bool:
+    """Check if cached session is still valid."""
+    if session_id not in _session_cache:
+        return False
+    _, loaded_at = _session_cache[session_id]
+    return time_now() - loaded_at < SESSION_CACHE_TTL_SECONDS
+
+
+def _get_cached_session(session_id: str, user_id: str) -> Optional["Session"]:
+    """Get session from cache if valid and owned by user."""
+    if not _is_session_cache_valid(session_id):
+        return None
+    session, _ = _session_cache[session_id]
+    if session.user_id == user_id:
+        return session
+    return None
+
+
+def _cache_session(session: "Session") -> None:
+    """Cache a session with current timestamp."""
+    _session_cache[session.id] = (session, time_now())
+
+
+def _evict_session(session_id: str) -> None:
+    """Remove session from cache."""
+    _session_cache.pop(session_id, None)
+
+
+def clear_session_cache() -> None:
+    """Clear the entire session cache (for testing)."""
+    _session_cache.clear()
 
 # Summarization prompts from Clawdbot (pi-mono/packages/coding-agent/src/core/compaction/)
 SUMMARIZATION_SYSTEM_PROMPT = """You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
@@ -215,7 +265,7 @@ class SessionManager:
         self._supabase = supabase_client
         self._memory_manager = memory_manager
         self._context = get_context_manager()
-        self._sessions_cache: Dict[str, Session] = {}
+        # Note: Using module-level TTL cache instead of instance cache
     
     def create_session(self, user_id: str, title: Optional[str] = None) -> Session:
         """Create a new session."""
@@ -224,7 +274,7 @@ class SessionManager:
             user_id=user_id,
             title=title
         )
-        self._sessions_cache[session.id] = session
+        _cache_session(session)  # TTL-based cache (Clawdbot pattern)
         logger.info(f"Created session {session.id} for user {user_id}")
         return session
 
@@ -244,9 +294,9 @@ class SessionManager:
             except Exception as e:
                 logger.error(f"Failed to list sessions: {e}")
 
-        # Fallback to cache
+        # Fallback to TTL cache (Clawdbot pattern)
         sessions = [
-            s for s in self._sessions_cache.values() if s.user_id == user_id
+            s for s, _ in _session_cache.values() if s.user_id == user_id
         ]
         sessions.sort(key=lambda s: s.updated_at, reverse=True)
         return [
@@ -276,8 +326,9 @@ class SessionManager:
             except Exception as e:
                 logger.error(f"Failed to list session summaries: {e}")
 
+        # Fallback to TTL cache (Clawdbot pattern)
         sessions = [
-            s for s in self._sessions_cache.values() if s.user_id == user_id
+            s for s, _ in _session_cache.values() if s.user_id == user_id
         ]
         sessions.sort(key=lambda s: s.updated_at, reverse=True)
         return [
@@ -291,7 +342,7 @@ class SessionManager:
 
     async def delete_session(self, session_id: str, user_id: str) -> bool:
         """Delete a session from storage."""
-        self._sessions_cache.pop(session_id, None)
+        _evict_session(session_id)  # TTL cache eviction (Clawdbot pattern)
         if not self._supabase:
             return True
         try:
@@ -347,12 +398,11 @@ class SessionManager:
             return []
     
     async def load_session(self, session_id: str, user_id: str) -> Optional[Session]:
-        """Load a session from storage or cache."""
-        # Check cache first
-        if session_id in self._sessions_cache:
-            session = self._sessions_cache[session_id]
-            if session.user_id == user_id:
-                return session
+        """Load a session from storage or TTL cache (Clawdbot pattern)."""
+        # Check TTL cache first (Clawdbot session-manager-cache.ts pattern)
+        cached = _get_cached_session(session_id, user_id)
+        if cached:
+            return cached
         
         # Load from Supabase
         if self._supabase:
@@ -370,7 +420,7 @@ class SessionManager:
                         compaction_count=session_data.get("compaction_count", 0),
                         metadata=json.loads(session_data.get("metadata", "{}"))
                     )
-                    self._sessions_cache[session_id] = session
+                    _cache_session(session)  # TTL cache (Clawdbot pattern)
                     return session
             except Exception as e:
                 logger.error(f"Failed to load session {session_id}: {e}")
@@ -379,6 +429,9 @@ class SessionManager:
     
     async def save_session(self, session: Session) -> bool:
         """Save session to storage."""
+        # Update TTL cache immediately (Clawdbot pattern)
+        _cache_session(session)
+        
         if not self._supabase:
             logger.warning("No Supabase client - session not persisted")
             return False
@@ -402,6 +455,26 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Failed to save session {session.id}: {e}")
             return False
+    
+    def save_session_background(self, session: Session) -> None:
+        """
+        Fire-and-forget session save (Clawdbot pattern).
+        
+        Updates cache immediately, schedules DB write in background.
+        This reduces perceived latency by not waiting for DB writes.
+        """
+        # Update cache immediately for subsequent reads
+        _cache_session(session)
+        
+        # Schedule DB write in background
+        asyncio.create_task(self._save_session_background_task(session))
+    
+    async def _save_session_background_task(self, session: Session) -> None:
+        """Background task for session save."""
+        try:
+            await self.save_session(session)
+        except Exception as e:
+            logger.error(f"Background save failed for session {session.id}: {e}")
     
     async def add_message(
         self,
