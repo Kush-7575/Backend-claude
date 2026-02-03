@@ -1,259 +1,388 @@
 """
-Streaming TTS Provider (Clawdbot Pattern)
+Streaming TTS Provider using Deepgram WebSocket API
 
-Provides streaming text-to-speech using OpenAI's tts-1 API.
-Audio chunks are yielded as soon as they're available for
-immediate playback.
+Provides ultra-low-latency text-to-speech using Deepgram's streaming TTS.
+Supports progressive text input - you can send text chunks as Claude
+generates them, and receive audio immediately.
 
-Based on Clawdbot's TTS implementation (src/tts/tts.ts)
+Key advantages over OpenAI TTS:
+- True progressive streaming (send text word-by-word)
+- ~100-200ms time-to-first-audio
+- Same provider as STT (unified billing)
 """
 import asyncio
 import logging
 from typing import AsyncIterator, Optional, Literal
 from dataclasses import dataclass
 
-import httpx
+from deepgram import AsyncDeepgramClient
+from deepgram.extensions.types.sockets import (
+    SpeakV1TextMessage,
+    SpeakV1ControlMessage,
+)
 
 from core.config import settings
 
 logger = logging.getLogger("brainmap.tts")
 
 
-# OpenAI TTS voices
-TTSVoice = Literal["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+# Deepgram Aura TTS voices - natural conversational voices
+DeepgramVoice = Literal[
+    "aura-asteria-en",    # Female, warm & expressive (recommended)
+    "aura-luna-en",       # Female, calm & soothing
+    "aura-stella-en",     # Female, clear & articulate
+    "aura-athena-en",     # Female, authoritative
+    "aura-hera-en",       # Female, friendly
+    "aura-orion-en",      # Male, deep & resonant
+    "aura-arcas-en",      # Male, warm & approachable
+    "aura-perseus-en",    # Male, clear & professional
+    "aura-angus-en",      # Male, Scottish accent
+    "aura-orpheus-en",    # Male, expressive
+    "aura-helios-en",     # Male, bright & energetic
+    "aura-zeus-en",       # Male, authoritative
+]
 
-# Audio formats
-TTSFormat = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
+# Audio encoding formats
+TTSEncoding = Literal["linear16", "mulaw", "alaw", "mp3", "opus", "flac", "aac"]
 
 
 @dataclass
-class TTSConfig:
-    """Configuration for TTS."""
+class DeepgramTTSConfig:
+    """Configuration for Deepgram TTS."""
     api_key: str
-    model: str = "tts-1"  # tts-1 (fast) or tts-1-hd (quality)
-    voice: TTSVoice = "alloy"
-    format: TTSFormat = "mp3"
-    speed: float = 1.0  # 0.25 to 4.0
+    model: DeepgramVoice = "aura-asteria-en"  # Best conversational voice
+    encoding: TTSEncoding = "mp3"  # MP3 for broad compatibility
+    sample_rate: int = 24000  # 24kHz for good quality
 
 
-class StreamingTTSProvider:
+class DeepgramStreamingTTS:
     """
-    Streaming TTS using OpenAI's API.
+    Streaming TTS using Deepgram's WebSocket API.
     
-    Streams audio chunks as they become available for
-    minimal time-to-first-audio.
+    Supports progressive text input - send text as Claude generates it,
+    receive audio immediately. Much lower latency than batch TTS.
+    
+    Usage:
+        async with DeepgramStreamingTTS() as tts:
+            # Send text progressively
+            await tts.send_text("Hello, ")
+            await tts.send_text("how are you today?")
+            await tts.flush()  # Signal end of text
+            
+            # Receive audio chunks
+            async for audio_chunk in tts.audio_stream():
+                yield audio_chunk
     """
     
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "tts-1",
-        voice: TTSVoice = "alloy",
-        format: TTSFormat = "mp3",
-        speed: float = 1.0,
+        model: DeepgramVoice = "aura-asteria-en",
+        encoding: TTSEncoding = "mp3",
+        sample_rate: int = 24000,
     ):
-        self.api_key = api_key or settings.OPENAI_API_KEY
+        self.api_key = api_key or settings.DEEPGRAM_API_KEY
         if not self.api_key:
-            raise ValueError("OpenAI API key required for TTS")
+            raise ValueError("Deepgram API key required for TTS")
         
         self.model = model
-        self.voice = voice
-        self.format = format
-        self.speed = speed
+        self.encoding = encoding
+        self.sample_rate = sample_rate
         
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
-        )
+        self._client: Optional[AsyncDeepgramClient] = None
+        self._socket = None
+        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._receive_task: Optional[asyncio.Task] = None
+        self._connected = False
+        self._finished = False
     
-    async def stream_speech(
-        self,
-        text: str,
-        voice: Optional[TTSVoice] = None,
-        speed: Optional[float] = None,
-    ) -> AsyncIterator[bytes]:
-        """
-        Stream audio chunks for the given text.
+    async def connect(self) -> None:
+        """Establish WebSocket connection to Deepgram TTS."""
+        if self._connected:
+            return
         
-        Args:
-            text: Text to convert to speech
-            voice: Override default voice
-            speed: Override default speed
-            
-        Yields:
-            Audio chunks (in configured format)
+        self._client = AsyncDeepgramClient(api_key=self.api_key)
+        
+        # Connect to TTS WebSocket
+        self._socket = await self._client.speak.v1.connect(
+            model=self.model,
+            encoding=self.encoding,
+            sample_rate=str(self.sample_rate),
+        ).__aenter__()
+        
+        self._connected = True
+        self._finished = False
+        
+        # Start receiving audio in background
+        self._receive_task = asyncio.create_task(self._receive_audio())
+        
+        logger.debug(f"Deepgram TTS connected: model={self.model}, encoding={self.encoding}")
+    
+    async def _receive_audio(self) -> None:
+        """Background task to receive audio chunks from Deepgram."""
+        try:
+            async for message in self._socket:
+                if isinstance(message, bytes):
+                    # Binary audio chunk - add to queue
+                    await self._audio_queue.put(message)
+                else:
+                    # JSON message (metadata, control response)
+                    logger.debug(f"TTS control message: {message}")
+        except Exception as e:
+            logger.error(f"TTS receive error: {e}")
+        finally:
+            # Signal end of audio
+            await self._audio_queue.put(None)
+    
+    async def send_text(self, text: str) -> None:
         """
+        Send text to be converted to speech.
+        
+        Can be called multiple times for progressive streaming.
+        Audio will start being generated immediately.
+        """
+        if not self._connected:
+            await self.connect()
+        
         if not text.strip():
             return
         
-        voice = voice or self.voice
-        speed = speed if speed is not None else self.speed
-        
-        url = "https://api.openai.com/v1/audio/speech"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": self.model,
-            "input": text,
-            "voice": voice,
-            "response_format": self.format,
-            "speed": speed,
-        }
-        
-        try:
-            async with self._client.stream(
-                "POST",
-                url,
-                headers=headers,
-                json=payload,
-            ) as response:
-                if response.status_code != 200:
-                    error_text = await response.aread()
-                    logger.error(f"TTS API error: {response.status_code} - {error_text}")
-                    return
-                
-                # Stream audio chunks
-                async for chunk in response.aiter_bytes(chunk_size=4096):
-                    if chunk:
-                        yield chunk
-                        
-        except httpx.TimeoutException as e:
-            logger.error(f"TTS timeout: {e}")
-        except Exception as e:
-            logger.error(f"TTS error: {e}")
+        message = SpeakV1TextMessage(type="Speak", text=text)
+        await self._socket.send_text(message)
+        logger.debug(f"TTS sent: {text[:50]}...")
     
-    async def speak(self, text: str, voice: Optional[TTSVoice] = None) -> bytes:
+    async def flush(self) -> None:
         """
-        Convert text to speech and return complete audio.
+        Signal that all text has been sent.
         
-        For streaming playback, use stream_speech() instead.
+        Deepgram will generate remaining audio and close the stream.
         """
-        chunks = []
-        async for chunk in self.stream_speech(text, voice=voice):
-            chunks.append(chunk)
-        return b"".join(chunks)
+        if not self._connected:
+            return
+        
+        message = SpeakV1ControlMessage(type="Flush")
+        await self._socket.send_control(message)
+        logger.debug("TTS flushed")
     
     async def close(self) -> None:
-        """Close the HTTP client."""
-        await self._client.aclose()
+        """Close the TTS connection."""
+        if not self._connected:
+            return
+        
+        try:
+            message = SpeakV1ControlMessage(type="Close")
+            await self._socket.send_control(message)
+        except Exception:
+            pass
+        
+        self._connected = False
+        self._finished = True
+        
+        if self._receive_task:
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.debug("TTS connection closed")
+    
+    async def audio_stream(self) -> AsyncIterator[bytes]:
+        """
+        Yield audio chunks as they become available.
+        
+        Call this while sending text to stream audio in real-time.
+        """
+        while True:
+            chunk = await self._audio_queue.get()
+            if chunk is None:
+                # End of stream
+                break
+            yield chunk
+    
+    async def __aenter__(self):
+        await self.connect()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
 
-class ChunkedTTSStreamer:
+class ProgressiveTTSStreamer:
     """
-    Streams TTS for text that's still being generated.
+    Streams TTS for text that's being generated by Claude.
     
-    Accumulates text until a natural breakpoint (sentence end),
-    then streams TTS for that chunk while accumulating more.
-    This minimizes time-to-first-audio while agent is still thinking.
+    Detects sentence boundaries and sends complete sentences to TTS
+    for immediate audio generation. This minimizes time-to-first-audio
+    while the agent is still generating text.
     
-    Based on Clawdbot's chunked TTS pattern.
+    Usage:
+        streamer = ProgressiveTTSStreamer()
+        
+        # As Claude generates text:
+        for chunk in claude_stream:
+            streamer.add_text(chunk)
+            async for audio in streamer.get_audio():
+                yield audio
+        
+        # When Claude is done:
+        streamer.finish()
+        async for audio in streamer.get_audio():
+            yield audio
     """
     
     def __init__(
         self,
-        tts_provider: StreamingTTSProvider,
-        min_chunk_chars: int = 20,
-        sentence_endings: str = ".!?;:",
+        api_key: Optional[str] = None,
+        model: DeepgramVoice = "aura-asteria-en",
+        min_sentence_chars: int = 15,  # Minimum chars before looking for break
+        sentence_endings: str = ".!?;",
     ):
-        self.tts = tts_provider
-        self.min_chunk_chars = min_chunk_chars
+        self.api_key = api_key or settings.DEEPGRAM_API_KEY
+        self.model = model
+        self.min_sentence_chars = min_sentence_chars
         self.sentence_endings = sentence_endings
         
         self._buffer = ""
-        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
-        self._text_complete = False
-        self._tts_task: Optional[asyncio.Task] = None
+        self._tts: Optional[DeepgramStreamingTTS] = None
+        self._started = False
+        self._finished = False
         self._aborted = False
     
+    async def _ensure_connected(self) -> None:
+        """Ensure TTS connection is established."""
+        if self._tts is None:
+            self._tts = DeepgramStreamingTTS(
+                api_key=self.api_key,
+                model=self.model,
+            )
+            await self._tts.connect()
+            self._started = True
+    
     def add_text(self, text: str) -> None:
-        """Add text chunk from the agent stream."""
-        if self._aborted:
+        """
+        Add text chunk from Claude stream.
+        
+        Text is buffered until a sentence boundary is detected.
+        """
+        if self._aborted or self._finished:
             return
         self._buffer += text
-        
-        # Check if we have a complete sentence to speak
-        self._maybe_start_tts()
     
-    def _maybe_start_tts(self) -> None:
-        """Start TTS if we have enough text at a natural breakpoint."""
-        if len(self._buffer) < self.min_chunk_chars:
+    async def get_pending_audio(self) -> AsyncIterator[bytes]:
+        """
+        Check for complete sentences and yield any available audio.
+        
+        Call this after each add_text() to stream audio progressively.
+        """
+        if self._aborted:
+            return
+        
+        # Check for sentence boundary
+        await self._maybe_send_sentence()
+        
+        # Yield any available audio (non-blocking)
+        if self._tts:
+            while not self._tts._audio_queue.empty():
+                chunk = await self._tts._audio_queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+    
+    async def _maybe_send_sentence(self) -> None:
+        """Send complete sentences to TTS."""
+        if len(self._buffer) < self.min_sentence_chars:
             return
         
         # Find last sentence ending
         best_break = -1
         for i, char in enumerate(self._buffer):
             if char in self.sentence_endings:
-                best_break = i
+                # Check for space after (to avoid "Dr." or "3.14")
+                if i + 1 < len(self._buffer) and self._buffer[i + 1] in " \n":
+                    best_break = i + 1
+                elif i + 1 == len(self._buffer):
+                    best_break = i + 1
         
-        if best_break >= self.min_chunk_chars - 1:
-            # Extract the chunk to speak
-            chunk = self._buffer[:best_break + 1].strip()
-            self._buffer = self._buffer[best_break + 1:]
+        if best_break >= self.min_sentence_chars:
+            sentence = self._buffer[:best_break].strip()
+            self._buffer = self._buffer[best_break:]
             
-            if chunk:
-                # Queue TTS for this chunk
-                asyncio.create_task(self._stream_chunk_to_queue(chunk))
+            if sentence:
+                await self._ensure_connected()
+                await self._tts.send_text(sentence + " ")
+                logger.debug(f"Progressive TTS: sent '{sentence[:30]}...'")
     
-    async def _stream_chunk_to_queue(self, text: str) -> None:
-        """Stream TTS audio into the queue."""
-        try:
-            async for audio in self.tts.stream_speech(text):
-                if self._aborted:
-                    break
-                await self._audio_queue.put(audio)
-        except Exception as e:
-            logger.error(f"Chunked TTS error: {e}")
-    
-    def finish_text(self) -> None:
-        """Signal that all text has been added."""
-        self._text_complete = True
+    async def finish(self) -> AsyncIterator[bytes]:
+        """
+        Signal that all text has been added.
         
-        # Speak any remaining buffer
+        Sends any remaining buffer and yields all remaining audio.
+        """
+        if self._aborted:
+            return
+        
+        self._finished = True
+        
+        # Send remaining buffer
         if self._buffer.strip():
-            asyncio.create_task(self._stream_chunk_to_queue(self._buffer.strip()))
+            await self._ensure_connected()
+            await self._tts.send_text(self._buffer.strip())
             self._buffer = ""
-    
-    async def stream_audio(self) -> AsyncIterator[bytes]:
-        """
-        Yield audio chunks as they become available.
         
-        Call this while add_text() is being called from another task.
-        """
-        while True:
-            try:
-                # Wait for audio with timeout
-                audio = await asyncio.wait_for(
-                    self._audio_queue.get(),
-                    timeout=0.1
-                )
-                yield audio
-            except asyncio.TimeoutError:
-                # Check if we're done
-                if self._text_complete and self._audio_queue.empty():
-                    break
-                if self._aborted:
-                    break
+        # Flush and close
+        if self._tts:
+            await self._tts.flush()
+            
+            # Yield remaining audio
+            async for chunk in self._tts.audio_stream():
+                yield chunk
+            
+            await self._tts.close()
     
-    def abort(self) -> None:
-        """Abort the TTS stream (for barge-in)."""
+    async def abort(self) -> None:
+        """Abort TTS stream (for barge-in)."""
         self._aborted = True
         self._buffer = ""
-        # Clear the queue
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        
+        if self._tts:
+            await self._tts.close()
+            self._tts = None
 
 
-# Singleton provider
-_tts_provider: Optional[StreamingTTSProvider] = None
+# =============================================================================
+# Singleton / Factory
+# =============================================================================
+
+_tts_instance: Optional[DeepgramStreamingTTS] = None
 
 
-def get_tts_provider() -> StreamingTTSProvider:
-    """Get the singleton TTS provider."""
-    global _tts_provider
-    if _tts_provider is None:
-        _tts_provider = StreamingTTSProvider()
-    return _tts_provider
+async def get_tts_connection() -> DeepgramStreamingTTS:
+    """Get a new TTS connection (for one-shot use)."""
+    tts = DeepgramStreamingTTS()
+    await tts.connect()
+    return tts
+
+
+def create_progressive_streamer() -> ProgressiveTTSStreamer:
+    """Create a new progressive TTS streamer for agent output."""
+    return ProgressiveTTSStreamer()
+
+
+# =============================================================================
+# Simple API for voice_stream.py
+# =============================================================================
+
+async def stream_tts(text: str) -> AsyncIterator[bytes]:
+    """
+    Simple one-shot TTS streaming.
+    
+    For progressive streaming during agent execution,
+    use ProgressiveTTSStreamer instead.
+    """
+    async with DeepgramStreamingTTS() as tts:
+        await tts.send_text(text)
+        await tts.flush()
+        
+        async for chunk in tts.audio_stream():
+            yield chunk
