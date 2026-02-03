@@ -451,11 +451,22 @@ async def process_transcript_with_agent(
 ):
     """
     Process the final transcript using Claude Agent.
-    Sends WebSocket messages for status and response.
+    Sends WebSocket messages for status, response, and TTS audio.
     """
+    import base64
+    from core.streaming_tts import get_tts_provider
+    from core.config import settings
+    
     async def safe_send_json(data: dict) -> bool:
         try:
             await websocket.send_json(data)
+            return True
+        except Exception:
+            return False
+    
+    async def safe_send_bytes(data: bytes) -> bool:
+        try:
+            await websocket.send_bytes(data)
             return True
         except Exception:
             return False
@@ -469,13 +480,16 @@ async def process_transcript_with_agent(
     try:
         if _agent_runner is None or _session_manager is None:
             # Fallback: just echo transcript
+            fallback_text = f"I heard: {transcript}"
             await safe_send_json({
                 "type": "chat_response",
                 "transcript": transcript,
-                "ai_response": f"I heard: {transcript}",
+                "ai_response": fallback_text,
                 "actions": [],
                 "responded": True
             })
+            # Stream TTS for fallback
+            await stream_tts_response(websocket, fallback_text, safe_send_json, safe_send_bytes)
             await safe_send_json({
                 "type": "complete",
                 "transcript": transcript,
@@ -526,6 +540,10 @@ async def process_transcript_with_agent(
             "responded": True
         })
         
+        # Stream TTS audio back to client (Clawdbot pattern)
+        if response_text:
+            await stream_tts_response(websocket, response_text, safe_send_json, safe_send_bytes)
+        
         await safe_send_json({
             "type": "complete",
             "transcript": transcript,
@@ -540,5 +558,51 @@ async def process_transcript_with_agent(
         logger.error(f"Agent processing error: {e}")
         await safe_send_json({
             "type": "error",
+            "message": str(e)
+        })
+
+
+async def stream_tts_response(
+    websocket: WebSocket,
+    text: str,
+    safe_send_json,
+    safe_send_bytes
+):
+    """
+    Stream TTS audio back to the client.
+    
+    Sends:
+    - {"type": "tts_start"} when TTS begins
+    - Binary audio chunks (MP3/Opus)
+    - {"type": "tts_end"} when TTS completes
+    """
+    import base64
+    from core.config import settings
+    
+    # Check if TTS is enabled and configured
+    if not settings.OPENAI_API_KEY:
+        logger.warning("TTS disabled: no OPENAI_API_KEY")
+        return
+    
+    try:
+        from core.streaming_tts import get_tts_provider
+        tts = get_tts_provider()
+        
+        await safe_send_json({"type": "tts_start"})
+        
+        # Stream audio chunks
+        chunk_count = 0
+        async for audio_chunk in tts.stream_speech(text):
+            # Send as binary for efficiency
+            await safe_send_bytes(audio_chunk)
+            chunk_count += 1
+        
+        logger.info(f"TTS complete: {chunk_count} audio chunks sent")
+        await safe_send_json({"type": "tts_end"})
+        
+    except Exception as e:
+        logger.error(f"TTS streaming error: {e}")
+        await safe_send_json({
+            "type": "tts_error",
             "message": str(e)
         })

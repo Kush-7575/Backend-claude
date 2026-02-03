@@ -107,10 +107,10 @@ async def lifespan(app: FastAPI):
     set_chat_deps(agent, sessions)
     logger.info("✅ Chat router wired")
     
-    # Wire up voice router
+    # Wire up voice router (Deepgram STT + OpenAI TTS)
     from routers.voice_stream import set_dependencies as set_voice_deps
     set_voice_deps(agent, sessions)
-    logger.info("🎤 Voice router wired")
+    logger.info("🎤 Voice router wired (Deepgram STT + TTS)")
 
     # Wire up diagnostics router
     from routers.diagnostics import set_dependencies as set_diag_deps
