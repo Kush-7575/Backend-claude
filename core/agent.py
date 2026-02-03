@@ -812,8 +812,8 @@ class AgentRunner:
             # Pre-turn hooks
             user_message = await self._run_pre_hooks(session, user_message)
 
-            # Add user message to session
-            await self._session.add_message(session, "user", user_message)
+        # Add user message to session
+        await self._session.add_message(session, "user", user_message)
 
             session.metadata.setdefault("lifecycle_events", []).append({
                 "phase": "start",
@@ -822,20 +822,20 @@ class AgentRunner:
 
             # Clawdbot-style: do not auto-prefetch memory into the prompt
         
-            # Get messages for API
+        # Get messages for API
             raw_messages = session.get_api_messages(prune=settings.CONTEXT_PRUNE_ENABLED)
         
-            # Check context and truncate if needed
+        # Check context and truncate if needed
             if self._context.needs_compaction(raw_messages):
-                logger.warning("Context needs compaction - truncating for now")
+            logger.warning("Context needs compaction - truncating for now")
                 raw_messages = self._context.truncate_to_fit(raw_messages)
 
             # Soft-trim oversized message blocks (Clawdbot-like pruning)
             messages = self._context.soft_trim_messages(raw_messages)
         
-            # Build system prompt if not provided
+        # Build system prompt if not provided
             prompt_report = None
-            if system_prompt is None and self._prompt:
+        if system_prompt is None and self._prompt:
                 prompt_mode = self._resolve_prompt_mode(user_message)
                 if hasattr(self._prompt, "build_with_report"):
                     report = await self._prompt.build_with_report(
@@ -851,24 +851,24 @@ class AgentRunner:
                         context={"last_message": user_message, "skip_memory": True},
                         mode=prompt_mode
                     )
-            system_prompt = system_prompt or self._default_system_prompt()
+        system_prompt = system_prompt or self._default_system_prompt()
         
-            # Get tools if not provided
-            if tools is None and self._tools:
+        # Get tools if not provided
+        if tools is None and self._tools:
                 tools = self._resolve_tool_definitions(session)
         
-            # Make API call with retry
-            response = await self._call_claude_with_retry(
-                messages=messages,
-                system=system_prompt,
-                tools=tools
-            )
+        # Make API call with retry
+        response = await self._call_claude_with_retry(
+            messages=messages,
+            system=system_prompt,
+            tools=tools
+        )
         
-            # Add assistant response to session
-            if response.content:
-                await self._session.add_message(
-                    session, "assistant", response.content
-                )
+        # Add assistant response to session
+        if response.content:
+            await self._session.add_message(
+                session, "assistant", response.content
+            )
 
             if prompt_report:
                 session.metadata["last_prompt_report"] = prompt_report
@@ -888,7 +888,7 @@ class AgentRunner:
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
         
-            return response
+        return response
     
     async def run_stream(
         self,
@@ -973,9 +973,9 @@ class AgentRunner:
             # Pre-turn hooks
             user_message = await self._run_pre_hooks(session, user_message)
 
-            # Add user message (auto_compact=False, we'll handle compaction manually for streaming)
-            # Note: No nested lock needed - we're already inside session_lane
-            await self._session.add_message(session, "user", user_message, auto_compact=False)
+        # Add user message (auto_compact=False, we'll handle compaction manually for streaming)
+        # Note: No nested lock needed - we're already inside session_lane
+        await self._session.add_message(session, "user", user_message, auto_compact=False)
 
             session.metadata.setdefault("lifecycle_events", []).append({
                 "phase": "start",
@@ -990,25 +990,25 @@ class AgentRunner:
 
             # Clawdbot-style: do not auto-prefetch memory into the prompt
 
-            # Get messages for API
+        # Get messages for API
             raw_messages = session.get_api_messages(prune=settings.CONTEXT_PRUNE_ENABLED)
 
-            # Check if compaction is needed - trigger FULL compaction, not just truncation
-            # This is critical: streaming mode must also flush to memory and summarize
-            # Note: We already hold session lock, only acquire global lane for compaction
+        # Check if compaction is needed - trigger FULL compaction, not just truncation
+        # This is critical: streaming mode must also flush to memory and summarize
+        # Note: We already hold session lock, only acquire global lane for compaction
             if self._context.needs_compaction(raw_messages):
-                logger.info("Context needs compaction before stream - triggering full compaction")
-                try:
-                    # Only acquire global lane (we already have session lock)
-                    async with global_lane("compaction"):
+            logger.info("Context needs compaction before stream - triggering full compaction")
+            try:
+                # Only acquire global lane (we already have session lock)
+                async with global_lane("compaction"):
                         yield StreamChunk(
                             type="lifecycle",
                             content="compaction_start",
                             metadata={"phase": "compaction_start"}
                         )
-                        # Trigger the proper compaction flow (flush to memory + summarize)
-                        await self._session._compact_session(session)
-                    # Refresh messages after compaction
+                    # Trigger the proper compaction flow (flush to memory + summarize)
+                    await self._session._compact_session(session)
+                # Refresh messages after compaction
                     raw_messages = session.get_api_messages()
                     logger.info(f"Compaction complete, now have {len(raw_messages)} messages")
                     yield StreamChunk(
@@ -1016,8 +1016,8 @@ class AgentRunner:
                         content="compaction_end",
                         metadata={"phase": "compaction_end"}
                     )
-                except Exception as e:
-                    logger.error(f"Compaction failed, falling back to truncation: {e}")
+            except Exception as e:
+                logger.error(f"Compaction failed, falling back to truncation: {e}")
                     raw_messages = self._context.truncate_to_fit(raw_messages)
 
             # Soft-trim oversized message blocks (Clawdbot-like pruning)
@@ -1052,17 +1052,17 @@ class AgentRunner:
                 model_id=settings.CLAUDE_MODEL
             )
             cache_trace.record_stage("prompt:before", messages=messages, system=system_prompt)
-            
-            # Build system prompt with context for memory retrieval
+        
+        # Build system prompt with context for memory retrieval
             prompt_report = None
-            if system_prompt is None and self._prompt:
+        if system_prompt is None and self._prompt:
                 prompt_mode = self._resolve_prompt_mode(user_message)
-                # Pass the user message for memory context retrieval
-                prompt_context = {
-                    "last_message": user_message,
+            # Pass the user message for memory context retrieval
+            prompt_context = {
+                "last_message": user_message,
                     "channel": "stream",
                     "skip_memory": True
-                }
+            }
                 if hasattr(self._prompt, "build_with_report"):
                     report = await self._prompt.build_with_report(
                         session.user_id,
@@ -1077,16 +1077,16 @@ class AgentRunner:
                         context=prompt_context,
                         mode=prompt_mode
                     )
-            system_prompt = system_prompt or self._default_system_prompt()
+        system_prompt = system_prompt or self._default_system_prompt()
             
             # Append cache TTL timestamp for prompt caching (Clawdbot pattern)
             system_prompt = append_cache_ttl_timestamp(system_prompt, provider="anthropic")
-            
-            # Get tools
-            if tools is None and self._tools:
+        
+        # Get tools
+        if tools is None and self._tools:
                 tools = self._resolve_tool_definitions(session)
-            
-            full_response = []
+        
+        full_response = []
             client = await self._get_client()
             
             # Use cached system prompt format

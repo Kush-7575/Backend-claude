@@ -158,7 +158,7 @@ class ToolRegistry:
     def get_tool_definitions(self, allowlist: Optional[set[str]] = None) -> List[Dict[str, Any]]:
         """Get tools in Claude API format, optionally filtered by allowlist."""
         if allowlist is None:
-            return [tool.to_api_format() for tool in self._tools.values()]
+        return [tool.to_api_format() for tool in self._tools.values()]
         return [
             tool.to_api_format()
             for name, tool in self._tools.items()
