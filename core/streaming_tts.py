@@ -51,7 +51,7 @@ class DeepgramTTSConfig:
     """Configuration for Deepgram TTS."""
     api_key: str
     model: DeepgramVoice = "aura-asteria-en"  # Best conversational voice
-    encoding: TTSEncoding = "mp3"  # MP3 for broad compatibility
+    encoding: TTSEncoding = "linear16"  # Raw PCM for true real-time streaming
     sample_rate: int = 24000  # 24kHz for good quality
 
 
@@ -78,7 +78,7 @@ class DeepgramStreamingTTS:
         self,
         api_key: Optional[str] = None,
         model: DeepgramVoice = "aura-asteria-en",
-        encoding: TTSEncoding = "mp3",
+        encoding: TTSEncoding = "linear16",  # Raw PCM for zero-latency streaming
         sample_rate: int = 24000,
     ):
         self.api_key = api_key or settings.DEEPGRAM_API_KEY
