@@ -811,31 +811,29 @@ class AgentRunner:
         async with session_lane(session.id, f"run:{user_message[:20]}"):
             # Pre-turn hooks
             user_message = await self._run_pre_hooks(session, user_message)
-
-        # Add user message to session
-        await self._session.add_message(session, "user", user_message)
-
+            
+            # Add user message to session
+            await self._session.add_message(session, "user", user_message)
+            
             session.metadata.setdefault("lifecycle_events", []).append({
                 "phase": "start",
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
-
-            # Clawdbot-style: do not auto-prefetch memory into the prompt
-        
-        # Get messages for API
+            
+            # Get messages for API
             raw_messages = session.get_api_messages(prune=settings.CONTEXT_PRUNE_ENABLED)
-        
-        # Check context and truncate if needed
+            
+            # Check context and truncate if needed
             if self._context.needs_compaction(raw_messages):
-            logger.warning("Context needs compaction - truncating for now")
+                logger.warning("Context needs compaction - truncating for now")
                 raw_messages = self._context.truncate_to_fit(raw_messages)
-
+            
             # Soft-trim oversized message blocks (Clawdbot-like pruning)
             messages = self._context.soft_trim_messages(raw_messages)
-        
-        # Build system prompt if not provided
+            
+            # Build system prompt if not provided
             prompt_report = None
-        if system_prompt is None and self._prompt:
+            if system_prompt is None and self._prompt:
                 prompt_mode = self._resolve_prompt_mode(user_message)
                 if hasattr(self._prompt, "build_with_report"):
                     report = await self._prompt.build_with_report(
@@ -851,44 +849,44 @@ class AgentRunner:
                         context={"last_message": user_message, "skip_memory": True},
                         mode=prompt_mode
                     )
-        system_prompt = system_prompt or self._default_system_prompt()
-        
-        # Get tools if not provided
-        if tools is None and self._tools:
+            system_prompt = system_prompt or self._default_system_prompt()
+            
+            # Get tools if not provided
+            if tools is None and self._tools:
                 tools = self._resolve_tool_definitions(session)
-        
-        # Make API call with retry
-        response = await self._call_claude_with_retry(
-            messages=messages,
-            system=system_prompt,
-            tools=tools
-        )
-        
-        # Add assistant response to session
-        if response.content:
-            await self._session.add_message(
-                session, "assistant", response.content
+            
+            # Make API call with retry
+            response = await self._call_claude_with_retry(
+                messages=messages,
+                system=system_prompt,
+                tools=tools
             )
-
-            if prompt_report:
-                session.metadata["last_prompt_report"] = prompt_report
-
-            if response.usage:
-                session.metadata["last_cache_stats"] = {
-                    "input_tokens": response.usage.get("input_tokens"),
-                    "output_tokens": response.usage.get("output_tokens"),
-                    "cache_read_tokens": response.usage.get("cache_read_tokens"),
-                    "cache_write_tokens": response.usage.get("cache_write_tokens")
-                }
-
-            await self._run_post_hooks(session, user_message, response.content or "")
-
-            session.metadata.setdefault("lifecycle_events", []).append({
-                "phase": "end",
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-        
-        return response
+            
+            # Add assistant response to session
+            if response.content:
+                await self._session.add_message(
+                    session, "assistant", response.content
+                )
+                
+                if prompt_report:
+                    session.metadata["last_prompt_report"] = prompt_report
+                
+                if response.usage:
+                    session.metadata["last_cache_stats"] = {
+                        "input_tokens": response.usage.get("input_tokens"),
+                        "output_tokens": response.usage.get("output_tokens"),
+                        "cache_read_tokens": response.usage.get("cache_read_tokens"),
+                        "cache_write_tokens": response.usage.get("cache_write_tokens")
+                    }
+                
+                await self._run_post_hooks(session, user_message, response.content or "")
+                
+                session.metadata.setdefault("lifecycle_events", []).append({
+                    "phase": "end",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+            
+            return response
     
     async def run_stream(
         self,
