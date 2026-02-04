@@ -187,25 +187,14 @@ class DeepgramStreamingTTS:
         
         logger.debug("TTS connection closed")
     
-    async def audio_stream(self, timeout: float = 10.0) -> AsyncIterator[bytes]:
+    async def audio_stream(self) -> AsyncIterator[bytes]:
         """
         Yield audio chunks as they become available.
         
         Call this while sending text to stream audio in real-time.
-        Includes timeout protection to prevent indefinite blocking.
-        
-        Args:
-            timeout: Max seconds to wait for each chunk (default 10s)
         """
         while True:
-            try:
-                chunk = await asyncio.wait_for(
-                    self._audio_queue.get(),
-                    timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"TTS audio stream timeout after {timeout}s")
-                break
+            chunk = await self._audio_queue.get()
             if chunk is None:
                 # End of stream
                 break
